@@ -12,7 +12,13 @@ import paymentsRoutes from "./routes/payments.js";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+app.use(
+  cors({
+    origin: "https://coop-frontend-xi.vercel.app",
+  }),
+);
+
 app.use(express.json());
 
 app.use("/api/members", membersRoutes);
