@@ -13,12 +13,22 @@ dotenv.config();
 
 const app = express();
 
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://coop-frontend-xi.vercel.app",
+];
+
 app.use(
   cors({
-    origin: "https://coop-frontend-xi.vercel.app",
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
   }),
 );
-
 app.use(express.json());
 
 app.use("/api/members", membersRoutes);
