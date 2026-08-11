@@ -27,3 +27,30 @@ export const createProduct = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+export const updateProduct = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, category, interest_type, interest_rate, description } =
+      req.body;
+    const result = await pool.query(
+      `UPDATE products SET name=$1, category=$2, interest_type=$3, interest_rate=$4, description=$5
+       WHERE id=$6 RETURNING *`,
+      [name, category, interest_type, interest_rate, description, id],
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+export const deactivateProduct = async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE products SET active = false WHERE id = $1`, [id]);
+    res.json({ message: "Product deactivated" });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};

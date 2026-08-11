@@ -8,9 +8,8 @@ export const distributePayment = async (req, res) => {
       date,
       loan_id,
       savings, // now an object: { [product_id]: amount, ... }
+      other,
       loan_repayment,
-      card,
-      reg_fee,
       notes,
     } = req.body;
 
@@ -28,21 +27,16 @@ export const distributePayment = async (req, res) => {
         }
       }
     }
-
-    // Card and registration fee stay as fixed, non-product categories
-    if (card && parseFloat(card) > 0) {
-      await client.query(
-        `INSERT INTO contributions (member_id, amount, type, contribution_date, notes)
-         VALUES ($1, $2, 'card', $3, $4)`,
-        [member_id, card, date, notes || null],
-      );
-    }
-    if (reg_fee && parseFloat(reg_fee) > 0) {
-      await client.query(
-        `INSERT INTO contributions (member_id, amount, type, contribution_date, notes)
-         VALUES ($1, $2, 'registration', $3, $4)`,
-        [member_id, reg_fee, date, notes || null],
-      );
+    if (other && typeof other === "object") {
+      for (const [productId, amount] of Object.entries(other)) {
+        if (amount && parseFloat(amount) > 0) {
+          await client.query(
+            `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id)
+             VALUES ($1, $2, 'other', $3, $4, $5)`,
+            [member_id, amount, date, notes || null, productId],
+          );
+        }
+      }
     }
 
     // Loan repayment — unchanged, still tied to a specific existing loan

@@ -1,103 +1,104 @@
-import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
-import pool from '../config/db.js';
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import pool from "../config/db.js";
 
 // REGISTER - member self-registers using email + phone to match their existing member record
-export const register = async (req, res) => {
+export const createMemberLogin = async (req, res) => {
   try {
-    const { phone, member_email, login_email, password } = req.body;
+    const { member_id, username, temp_password } = req.body;
 
-    // find the matching member record using phone + the email on file
-    const member = await pool.query(
-      'SELECT * FROM members WHERE phone = $1 AND email = $2',
-      [phone, member_email]
-    );
-
+    const member = await pool.query("SELECT * FROM members WHERE id = $1", [
+      member_id,
+    ]);
     if (member.rows.length === 0) {
-      return res.status(404).json({
-        error:
-          'No matching member record found. Check your phone number and email, or contact the cooperative.',
-      });
+      return res.status(404).json({ error: "Member not found" });
     }
 
-    const memberRecord = member.rows[0];
-
-    // check this member doesn't already have a login
     const existingUser = await pool.query(
-      'SELECT * FROM users WHERE member_id = $1',
-      [memberRecord.id]
+      "SELECT * FROM users WHERE member_id = $1",
+      [member_id],
     );
     if (existingUser.rows.length > 0) {
       return res
         .status(409)
-        .json({
-          error:
-            'An account already exists for this member. Please login instead.',
-        });
+        .json({ error: "This member already has a login." });
     }
 
-    // check the login email isn't already taken by someone else
-    const emailTaken = await pool.query(
-      'SELECT * FROM users WHERE email = $1',
-      [login_email]
+    const usernameTaken = await pool.query(
+      "SELECT * FROM users WHERE username = $1",
+      [username],
     );
-    if (emailTaken.rows.length > 0) {
-      return res
-        .status(409)
-        .json({ error: 'This email is already registered.' });
+    if (usernameTaken.rows.length > 0) {
+      return res.status(409).json({ error: "Username already taken." });
     }
 
-    const password_hash = await bcrypt.hash(password, 10);
+    const password_hash = await bcrypt.hash(temp_password, 10);
 
     const result = await pool.query(
-      `INSERT INTO users (member_id, email, password_hash) 
-       VALUES ($1, $2, $3) RETURNING id, member_id, email, role`,
-      [memberRecord.id, login_email, password_hash]
+      `INSERT INTO users (member_id, username, password_hash, must_change_password)
+       VALUES ($1, $2, $3, true) RETURNING id, member_id, username, role`,
+      [member_id, username, password_hash],
     );
 
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err.message);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: "Server error" });
   }
 };
 
-// LOGIN - unchanged
+export const changePassword = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { new_password } = req.body;
+    const password_hash = await bcrypt.hash(new_password, 10);
+
+    await pool.query(
+      `UPDATE users SET password_hash = $1, must_change_password = false WHERE id = $2`,
+      [password_hash, userId],
+    );
+    res.json({ message: "Password updated" });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
 export const login = async (req, res) => {
   try {
-    const { email, password } = req.body;
-
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [
-      email,
+    const { username, password } = req.body;
+    const result = await pool.query("SELECT * FROM users WHERE username = $1", [
+      username,
     ]);
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: "Invalid credentials" });
     }
 
     const user = result.rows[0];
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: "Invalid credentials" });
     }
 
     const token = jwt.sign(
       { userId: user.id, memberId: user.member_id, role: user.role },
       // eslint-disable-next-line no-undef
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: "7d" },
     );
 
     res.json({
       token,
       user: {
         id: user.id,
-        email: user.email,
+        username: user.username,
         role: user.role,
         member_id: user.member_id,
+        must_change_password: user.must_change_password,
       },
     });
   } catch (err) {
     console.error(err.message);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: "Server error" });
   }
 };
