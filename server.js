@@ -8,6 +8,7 @@ import authRoutes from "./routes/auth.js";
 import productsRoutes from "./routes/products.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import paymentsRoutes from "./routes/payments.js";
+import journalRoutes from "./routes/journal.js";
 
 dotenv.config();
 
@@ -39,6 +40,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/products", productsRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/journal", journalRoutes);
 
 // eslint-disable-next-line no-undef
 console.log("JWT_SECRET is", process.env.JWT_SECRET);
