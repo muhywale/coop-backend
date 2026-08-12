@@ -40,27 +40,47 @@ export const getLoansByMember = async (req, res) => {
 };
 
 // POST create new loan
+import { postJournal, getDefaultCashAccount } from "../utils/journal.js";
+
 export const createLoan = async (req, res) => {
+  const client = await pool.connect();
   try {
     const { member_id, principal, product_id } = req.body;
+    await client.query("BEGIN");
 
-    const product = await pool.query("SELECT * FROM products WHERE id = $1", [
+    const product = await client.query("SELECT * FROM products WHERE id = $1", [
       product_id,
     ]);
-    if (product.rows.length === 0) {
-      return res.status(404).json({ error: "Product not found" });
-    }
-    const { interest_rate } = product.rows[0];
+    if (product.rows.length === 0) throw new Error("Product not found");
+    const { interest_rate, linked_account_id } = product.rows[0];
 
-    const result = await pool.query(
-      `INSERT INTO loans (member_id, principal, interest_rate, product_id) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
+    const result = await client.query(
+      `INSERT INTO loans (member_id, principal, interest_rate, product_id) VALUES ($1, $2, $3, $4) RETURNING *`,
       [member_id, principal, interest_rate, product_id],
     );
+
+    const cashAccountId = await getDefaultCashAccount(client);
+    if (linked_account_id) {
+      await postJournal(client, {
+        entry_date: new Date().toISOString().slice(0, 10),
+        description: `Loan issued — member ${member_id}`,
+        source: "loan",
+        source_id: result.rows[0].id,
+        lines: [
+          { account_id: linked_account_id, debit: principal, credit: 0 },
+          { account_id: cashAccountId, debit: 0, credit: principal },
+        ],
+      });
+    }
+
+    await client.query("COMMIT");
     res.status(201).json(result.rows[0]);
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err.message);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 };
 
