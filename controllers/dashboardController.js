@@ -107,3 +107,87 @@ export const getPaymentsLedger = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+export const getMemberPaymentsLedger = async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    const { from, to } = req.query;
+
+    const result = await pool.query(
+      `SELECT 
+         c.id, c.contribution_date AS date, p.name AS product_name, 
+         p.category, c.type, c.amount, 'contribution' AS source
+       FROM contributions c
+       LEFT JOIN products p ON c.product_id = p.id
+       WHERE c.member_id = $1
+
+       UNION ALL
+
+       SELECT 
+         r.id, r.repayment_date AS date, p.name AS product_name,
+         'loan_repayment' AS category, 'loan_repayment' AS type, r.amount, 'repayment' AS source
+       FROM loan_repayments r
+       JOIN loans l ON r.loan_id = l.id
+       LEFT JOIN products p ON l.product_id = p.id
+       WHERE l.member_id = $1
+
+       ORDER BY date`,
+      [memberId], // ← this line was missing before
+    );
+
+    let rows = result.rows;
+    if (from && to) {
+      rows = rows.filter((r) => {
+        const dateStr = new Date(r.date).toISOString().slice(0, 10);
+        return dateStr >= from && dateStr <= to;
+      });
+    }
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+// Member's own version — same thing, scoped via token instead of URL param
+export const getMyPaymentsLedger = async (req, res) => {
+  try {
+    const memberId = req.user.memberId;
+    const { from, to } = req.query;
+
+    const result = await pool.query(
+      `SELECT 
+         c.id, c.contribution_date AS date, p.name AS product_name, 
+         p.category, c.type, c.amount, 'contribution' AS source
+       FROM contributions c
+       LEFT JOIN products p ON c.product_id = p.id
+       WHERE c.member_id = $1
+
+       UNION ALL
+
+       SELECT 
+         r.id, r.repayment_date AS date, p.name AS product_name,
+         'loan_repayment' AS category, 'loan_repayment' AS type, r.amount, 'repayment' AS source
+       FROM loan_repayments r
+       JOIN loans l ON r.loan_id = l.id
+       LEFT JOIN products p ON l.product_id = p.id
+       WHERE l.member_id = $1
+
+       ORDER BY date`,
+      [memberId],
+    );
+
+    let rows = result.rows;
+    if (from && to) {
+      rows = rows.filter((r) => {
+        const dateStr = new Date(r.date).toISOString().slice(0, 10);
+        return dateStr >= from && dateStr <= to;
+      });
+    }
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};

@@ -5,6 +5,8 @@ import {
   getLoansSummary,
   getBalancesByProduct,
   getPaymentsLedger,
+  getMyPaymentsLedger,
+  getMemberPaymentsLedger,
 } from "../controllers/dashboardController.js";
 
 const router = express.Router();
@@ -22,6 +24,15 @@ router.get(
   verifyToken,
   requireAdmin,
   getBalancesByProduct,
+  getMyPaymentsLedger,
 );
 router.get("/payments-ledger", verifyToken, requireAdmin, getPaymentsLedger);
+
+router.get(
+  "/member/:memberId/payments-ledger",
+  verifyToken,
+  requireAdmin,
+  getMemberPaymentsLedger,
+);
+router.get("/my-payments-ledger", verifyToken, getMyPaymentsLedger);
 export default router;
