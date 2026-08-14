@@ -191,3 +191,63 @@ export const getBalanceSheet = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+export const getAccountLedger = async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const { year } = req.query; // e.g. 2026
+
+    const account = await pool.query(
+      "SELECT * FROM chart_of_accounts WHERE id = $1",
+      [accountId],
+    );
+    if (account.rows.length === 0)
+      return res.status(404).json({ error: "Account not found" });
+    const { normal_balance } = account.rows[0];
+
+    // B/F: net balance of everything BEFORE Jan 1 of the selected year
+    const bfResult = await pool.query(
+      `SELECT COALESCE(SUM(l.debit), 0) AS total_debit, COALESCE(SUM(l.credit), 0) AS total_credit
+       FROM journal_lines l
+       JOIN journal_entries je ON je.id = l.journal_entry_id
+       WHERE l.account_id = $1 AND je.entry_date < $2`,
+      [accountId, `${year}-01-01`],
+    );
+    const bf =
+      normal_balance === "debit"
+        ? parseFloat(bfResult.rows[0].total_debit) -
+          parseFloat(bfResult.rows[0].total_credit)
+        : parseFloat(bfResult.rows[0].total_credit) -
+          parseFloat(bfResult.rows[0].total_debit);
+
+    // Monthly activity WITHIN the selected year
+    const monthlyResult = await pool.query(
+      `SELECT EXTRACT(MONTH FROM je.entry_date) AS month,
+              COALESCE(SUM(l.debit), 0) AS total_debit,
+              COALESCE(SUM(l.credit), 0) AS total_credit
+       FROM journal_lines l
+       JOIN journal_entries je ON je.id = l.journal_entry_id
+       WHERE l.account_id = $1 AND EXTRACT(YEAR FROM je.entry_date) = $2
+       GROUP BY EXTRACT(MONTH FROM je.entry_date)
+       ORDER BY month`,
+      [accountId, year],
+    );
+
+    // Build all 12 months, filling zeros where no activity, running balance forward
+    let runningBalance = bf;
+    const months = [];
+    for (let m = 1; m <= 12; m++) {
+      const row = monthlyResult.rows.find((r) => parseInt(r.month) === m);
+      const debit = row ? parseFloat(row.total_debit) : 0;
+      const credit = row ? parseFloat(row.total_credit) : 0;
+      const change =
+        normal_balance === "debit" ? debit - credit : credit - debit;
+      runningBalance += change;
+      months.push({ month: m, debit, credit, balance: runningBalance });
+    }
+
+    res.json({ account: account.rows[0], bf, months });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};

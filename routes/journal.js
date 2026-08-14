@@ -6,6 +6,7 @@ import {
   getTrialBalance,
   getIncomeExpenditure,
   getBalanceSheet,
+  getAccountLedger,
 } from "../controllers/journalController.js";
 
 const router = express.Router();
@@ -20,5 +21,11 @@ router.get(
   getIncomeExpenditure,
 );
 router.get("/balance-sheet", verifyToken, requireAdmin, getBalanceSheet);
+router.get(
+  "/accounts/:accountId/ledger",
+  verifyToken,
+  requireAdmin,
+  getAccountLedger,
+);
 
 export default router;
