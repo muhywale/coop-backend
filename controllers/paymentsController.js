@@ -148,11 +148,9 @@ export const withdrawFunds = async (req, res) => {
 
     if (parseFloat(amount) > currentBalance) {
       await client.query("ROLLBACK");
-      return res
-        .status(400)
-        .json({
-          error: `Insufficient balance. Available: ₦${currentBalance.toLocaleString()}`,
-        });
+      return res.status(400).json({
+        error: `Insufficient balance. Available: ₦${currentBalance.toLocaleString()}`,
+      });
     }
 
     await client.query(
@@ -187,6 +185,64 @@ export const withdrawFunds = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(err.message);
     res.status(500).json({ error: err.message || "Server error" });
+  } finally {
+    client.release();
+  }
+};
+export const correctContribution = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params; // the contribution's own id — familiar, visible in the ledger
+    await client.query("BEGIN");
+
+    const contribution = await client.query(
+      "SELECT * FROM contributions WHERE id = $1",
+      [id],
+    );
+    if (contribution.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+
+    // Find and reverse the matching journal entry, if one exists
+    const journalEntry = await client.query(
+      `SELECT id FROM journal_entries WHERE source = 'contribution' AND source_id = $1`,
+      [id],
+    );
+    if (journalEntry.rows.length > 0) {
+      const entryId = journalEntry.rows[0].id;
+      const lines = await client.query(
+        "SELECT * FROM journal_lines WHERE journal_entry_id = $1",
+        [entryId],
+      );
+
+      const reversalResult = await client.query(
+        `INSERT INTO journal_entries (entry_date, description, source, source_id)
+         VALUES (CURRENT_DATE, $1, 'reversal', $2) RETURNING id`,
+        [`Correction — reversing contribution #${id}`, entryId],
+      );
+      const reversalId = reversalResult.rows[0].id;
+
+      for (const line of lines.rows) {
+        await client.query(
+          `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit) VALUES ($1, $2, $3, $4)`,
+          [reversalId, line.account_id, line.credit, line.debit], // swapped to cancel out
+        );
+      }
+    }
+
+    // Remove the original contribution record itself
+    await client.query("DELETE FROM contributions WHERE id = $1", [id]);
+
+    await client.query("COMMIT");
+    res.json({
+      message: "Transaction corrected — you can now re-enter it correctly.",
+      original: contribution.rows[0], // send back the details so the frontend can pre-fill a new form
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }

@@ -69,21 +69,42 @@ export const createJournalEntry = async (req, res) => {
 export const getTrialBalance = async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT a.code, a.name, a.account_type,
+      `SELECT a.code, a.name, a.account_type, a.normal_balance,
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM chart_of_accounts a
        LEFT JOIN journal_lines l ON l.account_id = a.id
        WHERE a.active = true
-       GROUP BY a.id, a.code, a.name, a.account_type
+       GROUP BY a.id, a.code, a.name, a.account_type, a.normal_balance
        ORDER BY a.code`,
     );
-    res.json(result.rows);
+
+    const rows = result.rows.map((r) => {
+      const debit = parseFloat(r.total_debit);
+      const credit = parseFloat(r.total_credit);
+      const net =
+        r.normal_balance === "debit" ? debit - credit : credit - debit;
+
+      // If net is positive, it sits on the account's normal side.
+      // If negative, it's a contra balance — show the absolute value on the OTHER side instead of hiding it.
+      const onNormalSide = net >= 0;
+      const amount = Math.abs(net);
+
+      return {
+        code: r.code,
+        name: r.name,
+        debit: (r.normal_balance === "debit") === onNormalSide ? amount : 0,
+        credit: (r.normal_balance === "credit") === onNormalSide ? amount : 0,
+      };
+    });
+
+    res.json(rows);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: "Server error" });
   }
 };
+
 export const getIncomeExpenditure = async (req, res) => {
   try {
     const result = await pool.query(
