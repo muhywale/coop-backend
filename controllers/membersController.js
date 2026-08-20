@@ -82,7 +82,7 @@ export const getMemberDetail = async (req, res) => {
     }
 
     const balanceResult = await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN type = 'savings' THEN amount 
+      `SELECT COALESCE(SUM(CASE WHEN type IN ('savings','opening_balance') THEN amount 
                                  WHEN type = 'withdrawal' THEN -amount 
                                  ELSE 0 END), 0) AS balance
        FROM contributions WHERE member_id = $1`,
@@ -124,7 +124,7 @@ export const getMyDetail = async (req, res) => {
       [memberId],
     );
     const balanceResult = await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN type = 'savings' THEN amount 
+      `SELECT COALESCE(SUM(CASE WHEN type IN ('savings','opening_balance')  THEN amount 
                                  WHEN type = 'withdrawal' THEN -amount 
                                  ELSE 0 END), 0) AS balance
        FROM contributions WHERE member_id = $1`,
@@ -317,4 +317,140 @@ export const getMyLedger = async (req, res) => {
     console.error(err.message);
     res.status(500).json({ error: "Server error" });
   }
+};
+export const getMemberAccountsLedger = async (req, res) => {
+  try {
+    const { id } = req.params; // memberId (admin route) or resolved from token (self route)
+    const { groupBy = "month", year } = req.query; // 'day' | 'week' | 'month'
+
+    const truncUnit =
+      groupBy === "day" ? "day" : groupBy === "week" ? "week" : "month";
+
+    // Savings-type products (Shares, Savings, Build Fund, Special Deposit, etc.)
+    const savingsResult = await pool.query(
+      `SELECT p.id AS product_id, p.name AS product_name,
+              date_trunc($2, c.contribution_date) AS period,
+              COALESCE(SUM(CASE WHEN c.type = 'withdrawal' THEN c.amount ELSE 0 END), 0) AS dr,
+              COALESCE(SUM(CASE WHEN c.type IN ('savings','opening_balance') THEN c.amount ELSE 0 END), 0) AS cr
+       FROM contributions c
+       JOIN products p ON c.product_id = p.id
+       WHERE c.member_id = $1 AND p.category = 'savings'
+         AND EXTRACT(YEAR FROM c.contribution_date) = $3
+       GROUP BY p.id, p.name, period
+       ORDER BY p.name, period`,
+      [id, truncUnit, year],
+    );
+
+    // B/F per product — everything before the selected year
+    const bfResult = await pool.query(
+      `SELECT p.id AS product_id,
+              COALESCE(SUM(CASE WHEN c.type = 'withdrawal' THEN -c.amount ELSE c.amount END), 0) AS bf
+       FROM contributions c
+       JOIN products p ON c.product_id = p.id
+       WHERE c.member_id = $1 AND p.category = 'savings'
+         AND c.contribution_date < ($2 || '-01-01')::date
+       GROUP BY p.id`,
+      [id, year],
+    );
+    const bfMap = {};
+    bfResult.rows.forEach((r) => {
+      bfMap[r.product_id] = parseFloat(r.bf);
+    });
+
+    // Loans — DR = principal issued, CR = repayments, grouped the same way
+    const loanDrResult = await pool.query(
+      `SELECT p.id AS product_id, p.name AS product_name,
+              date_trunc($2, l.date_issued) AS period,
+              COALESCE(SUM(l.principal), 0) AS dr, 0 AS cr
+       FROM loans l
+       JOIN products p ON l.product_id = p.id
+       WHERE l.member_id = $1 AND p.category = 'loan'
+         AND EXTRACT(YEAR FROM l.date_issued) = $3
+       GROUP BY p.id, p.name, period`,
+      [id, truncUnit, year],
+    );
+    const loanCrResult = await pool.query(
+      `SELECT p.id AS product_id, p.name AS product_name,
+              date_trunc($2, r.repayment_date) AS period,
+              0 AS dr, COALESCE(SUM(r.amount), 0) AS cr
+       FROM loan_repayments r
+       JOIN loans l ON r.loan_id = l.id
+       JOIN products p ON l.product_id = p.id
+       WHERE l.member_id = $1 AND p.category = 'loan'
+         AND EXTRACT(YEAR FROM r.repayment_date) = $3
+       GROUP BY p.id, p.name, period`,
+      [id, truncUnit, year],
+    );
+    const loanBfResult = await pool.query(
+      `SELECT p.id AS product_id,
+              COALESCE(SUM(l.principal), 0) - COALESCE((
+                SELECT SUM(r.amount) FROM loan_repayments r
+                JOIN loans l2 ON r.loan_id = l2.id
+                WHERE l2.member_id = $1 AND l2.product_id = p.id
+                  AND r.repayment_date < ($2 || '-01-01')::date
+              ), 0) AS bf
+       FROM loans l
+       JOIN products p ON l.product_id = p.id
+       WHERE l.member_id = $1 AND p.category = 'loan'
+         AND l.date_issued < ($2 || '-01-01')::date
+       GROUP BY p.id`,
+      [id, year],
+    );
+    const loanBfMap = {};
+    loanBfResult.rows.forEach((r) => {
+      loanBfMap[r.product_id] = parseFloat(r.bf);
+    });
+
+    // Build response: one block per product, with running balance per period
+    const buildBlocks = (rows, bfLookup) => {
+      const byProduct = {};
+      rows.forEach((r) => {
+        if (!byProduct[r.product_id]) {
+          byProduct[r.product_id] = {
+            product_name: r.product_name,
+            bf: bfLookup[r.product_id] || 0,
+            periods: {},
+          };
+        }
+        const key = r.period.toISOString();
+        if (!byProduct[r.product_id].periods[key]) {
+          byProduct[r.product_id].periods[key] = {
+            period: r.period,
+            dr: 0,
+            cr: 0,
+          };
+        }
+        byProduct[r.product_id].periods[key].dr += parseFloat(r.dr);
+        byProduct[r.product_id].periods[key].cr += parseFloat(r.cr);
+      });
+
+      return Object.values(byProduct).map((block) => {
+        let running = block.bf;
+        const periods = Object.values(block.periods)
+          .sort((a, b) => new Date(a.period) - new Date(b.period))
+          .map((p) => {
+            running += p.cr - p.dr;
+            return { period: p.period, dr: p.dr, cr: p.cr, balance: running };
+          });
+        return { product_name: block.product_name, bf: block.bf, periods };
+      });
+    };
+
+    const savingsBlocks = buildBlocks(savingsResult.rows, bfMap);
+    const loanBlocks = buildBlocks(
+      [...loanDrResult.rows, ...loanCrResult.rows],
+      loanBfMap,
+    );
+
+    res.json({ savings: savingsBlocks, loans: loanBlocks });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+// Member's own version
+export const getMyAccountsLedger = async (req, res) => {
+  req.params.id = req.user.memberId;
+  return getMemberAccountsLedger(req, res);
 };

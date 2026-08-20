@@ -1,5 +1,5 @@
 import express from "express";
-import { verifyToken } from "../middleware/auth.js";
+import { verifyToken, requireAdmin } from "../middleware/auth.js";
 import {
   getMembers,
   getMemberById,
@@ -12,6 +12,8 @@ import {
   getMyTransactions,
   getMemberLedgerByProduct,
   getMyLedger,
+  getMyAccountsLedger,
+  getMemberAccountsLedger,
 } from "../controllers/membersController.js";
 
 const router = express.Router();
@@ -28,5 +30,12 @@ router.delete("/:id", deleteMember);
 router.get("/:id/detail", getMemberDetail);
 router.get("/:id/transactions", verifyToken, getMemberTransactions);
 router.get("/:id/ledger", getMemberLedgerByProduct);
+router.get(
+  "/:id/accounts-ledger",
+  verifyToken,
+  requireAdmin,
+  getMemberAccountsLedger,
+);
+router.get("/me/accounts-ledger", verifyToken, getMyAccountsLedger);
 
 export default router;

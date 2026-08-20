@@ -93,6 +93,7 @@ export const getTrialBalance = async (req, res) => {
       return {
         code: r.code,
         name: r.name,
+        account_type: r.account_type,
         debit: (r.normal_balance === "debit") === onNormalSide ? amount : 0,
         credit: (r.normal_balance === "credit") === onNormalSide ? amount : 0,
       };

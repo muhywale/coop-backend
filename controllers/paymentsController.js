@@ -139,7 +139,7 @@ export const withdrawFunds = async (req, res) => {
 
     // Check current balance for this member+product so we never let them withdraw more than they have
     const balanceResult = await client.query(
-      `SELECT COALESCE(SUM(CASE WHEN type = 'savings' THEN amount 
+      `SELECT COALESCE(SUM(CASE WHEN type IN ('savings','opening_balance') THEN amount 
                                  WHEN type = 'withdrawal' THEN -amount ELSE 0 END), 0) AS balance
        FROM contributions WHERE member_id = $1 AND product_id = $2`,
       [member_id, product_id],

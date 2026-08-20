@@ -4,7 +4,7 @@ export const getBalancesByProduct = async (req, res) => {
   try {
     const savingsResult = await pool.query(
       `SELECT m.id AS member_id, m.full_name, p.id AS product_id, p.name AS product_name, p.category,
-              COALESCE(SUM(CASE WHEN c.type = 'savings' THEN c.amount 
+              COALESCE(SUM(CASE WHEN c.type IN ('savings','opening_balance') THEN c.amount 
                                  WHEN c.type = 'withdrawal' THEN -c.amount ELSE 0 END), 0) AS balance
        FROM members m
        CROSS JOIN products p

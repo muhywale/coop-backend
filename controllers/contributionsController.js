@@ -63,7 +63,7 @@ export const getMemberBalance = async (req, res) => {
     const { memberId } = req.params;
     const result = await pool.query(
       `SELECT 
-         COALESCE(SUM(CASE WHEN type = 'savings' THEN amount 
+         COALESCE(SUM(CASE WHEN type  IN ('savings','opening_balance') THEN amount 
                             WHEN type = 'withdrawal' THEN -amount 
                             ELSE 0 END), 0) AS balance
        FROM contributions
