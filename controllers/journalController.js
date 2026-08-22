@@ -3,7 +3,8 @@ import pool from "../config/db.js";
 export const getAccounts = async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM chart_of_accounts WHERE active = true ORDER BY code",
+      "SELECT * FROM chart_of_accounts WHERE active = true AND cooperative_id = $1 ORDER BY code",
+      [req.user.cooperativeId],
     );
     res.json(result.rows);
   } catch (err) {
@@ -17,7 +18,7 @@ export const createJournalEntry = async (req, res) => {
   const client = await pool.connect();
   try {
     const { entry_date, description, lines } = req.body;
-    // lines: [{ account_id, debit, credit }, ...]
+    const coopId = req.user.cooperativeId;
 
     const totalDebit = lines.reduce(
       (sum, l) => sum + (parseFloat(l.debit) || 0),
@@ -37,8 +38,8 @@ export const createJournalEntry = async (req, res) => {
     await client.query("BEGIN");
 
     const entryResult = await client.query(
-      `INSERT INTO journal_entries (entry_date, description, source) VALUES ($1, $2, 'manual') RETURNING id`,
-      [entry_date, description],
+      `INSERT INTO journal_entries (entry_date, description, source, cooperative_id) VALUES ($1, $2, 'manual', $3) RETURNING id`,
+      [entry_date, description, coopId],
     );
     const entryId = entryResult.rows[0].id;
 
@@ -49,8 +50,8 @@ export const createJournalEntry = async (req, res) => {
       )
         continue;
       await client.query(
-        `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit) VALUES ($1, $2, $3, $4)`,
-        [entryId, line.account_id, line.debit || 0, line.credit || 0],
+        `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id) VALUES ($1, $2, $3, $4, $5)`,
+        [entryId, line.account_id, line.debit || 0, line.credit || 0, coopId],
       );
     }
 
@@ -73,10 +74,11 @@ export const getTrialBalance = async (req, res) => {
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM chart_of_accounts a
-       LEFT JOIN journal_lines l ON l.account_id = a.id
-       WHERE a.active = true
+       LEFT JOIN journal_lines l ON l.account_id = a.id AND l.cooperative_id = a.cooperative_id
+       WHERE a.active = true AND a.cooperative_id = $1
        GROUP BY a.id, a.code, a.name, a.account_type, a.normal_balance
        ORDER BY a.code`,
+      [req.user.cooperativeId],
     );
 
     const rows = result.rows.map((r) => {
@@ -85,8 +87,6 @@ export const getTrialBalance = async (req, res) => {
       const net =
         r.normal_balance === "debit" ? debit - credit : credit - debit;
 
-      // If net is positive, it sits on the account's normal side.
-      // If negative, it's a contra balance — show the absolute value on the OTHER side instead of hiding it.
       const onNormalSide = net >= 0;
       const amount = Math.abs(net);
 
@@ -113,10 +113,11 @@ export const getIncomeExpenditure = async (req, res) => {
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM chart_of_accounts a
-       LEFT JOIN journal_lines l ON l.account_id = a.id
-       WHERE a.active = true AND a.account_type IN ('income', 'expense')
+       LEFT JOIN journal_lines l ON l.account_id = a.id AND l.cooperative_id = a.cooperative_id
+       WHERE a.active = true AND a.account_type IN ('income', 'expense') AND a.cooperative_id = $1
        GROUP BY a.id, a.code, a.name, a.account_type
        ORDER BY a.account_type, a.code`,
+      [req.user.cooperativeId],
     );
 
     const income = result.rows
@@ -148,17 +149,20 @@ export const getIncomeExpenditure = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+
 export const getBalanceSheet = async (req, res) => {
   try {
+    const coopId = req.user.cooperativeId;
     const result = await pool.query(
       `SELECT a.code, a.name, a.account_type, a.normal_balance,
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM chart_of_accounts a
-       LEFT JOIN journal_lines l ON l.account_id = a.id
-       WHERE a.active = true AND a.account_type IN ('asset', 'liability', 'equity')
+       LEFT JOIN journal_lines l ON l.account_id = a.id AND l.cooperative_id = a.cooperative_id
+       WHERE a.active = true AND a.account_type IN ('asset', 'liability', 'equity') AND a.cooperative_id = $1
        GROUP BY a.id, a.code, a.name, a.account_type, a.normal_balance
        ORDER BY a.account_type, a.code`,
+      [coopId],
     );
 
     const computeNet = (r) =>
@@ -176,15 +180,15 @@ export const getBalanceSheet = async (req, res) => {
       .filter((r) => r.account_type === "equity")
       .map((r) => ({ ...r, net: computeNet(r) }));
 
-    // Pull current surplus from Income & Expenditure to fold into equity
     const ieResult = await pool.query(
       `SELECT a.account_type,
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM chart_of_accounts a
-       LEFT JOIN journal_lines l ON l.account_id = a.id
-       WHERE a.active = true AND a.account_type IN ('income', 'expense')
+       LEFT JOIN journal_lines l ON l.account_id = a.id AND l.cooperative_id = a.cooperative_id
+       WHERE a.active = true AND a.account_type IN ('income', 'expense') AND a.cooperative_id = $1
        GROUP BY a.account_type`,
+      [coopId],
     );
     let surplus = 0;
     ieResult.rows.forEach((r) => {
@@ -213,26 +217,27 @@ export const getBalanceSheet = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+
 export const getAccountLedger = async (req, res) => {
   try {
     const { accountId } = req.params;
-    const { year } = req.query; // e.g. 2026
+    const { year } = req.query;
+    const coopId = req.user.cooperativeId;
 
     const account = await pool.query(
-      "SELECT * FROM chart_of_accounts WHERE id = $1",
-      [accountId],
+      "SELECT * FROM chart_of_accounts WHERE id = $1 AND cooperative_id = $2",
+      [accountId, coopId],
     );
     if (account.rows.length === 0)
       return res.status(404).json({ error: "Account not found" });
     const { normal_balance } = account.rows[0];
 
-    // B/F: net balance of everything BEFORE Jan 1 of the selected year
     const bfResult = await pool.query(
       `SELECT COALESCE(SUM(l.debit), 0) AS total_debit, COALESCE(SUM(l.credit), 0) AS total_credit
        FROM journal_lines l
        JOIN journal_entries je ON je.id = l.journal_entry_id
-       WHERE l.account_id = $1 AND je.entry_date < $2`,
-      [accountId, `${year}-01-01`],
+       WHERE l.account_id = $1 AND l.cooperative_id = $2 AND je.entry_date < $3`,
+      [accountId, coopId, `${year}-01-01`],
     );
     const bf =
       normal_balance === "debit"
@@ -241,20 +246,18 @@ export const getAccountLedger = async (req, res) => {
         : parseFloat(bfResult.rows[0].total_credit) -
           parseFloat(bfResult.rows[0].total_debit);
 
-    // Monthly activity WITHIN the selected year
     const monthlyResult = await pool.query(
       `SELECT EXTRACT(MONTH FROM je.entry_date) AS month,
               COALESCE(SUM(l.debit), 0) AS total_debit,
               COALESCE(SUM(l.credit), 0) AS total_credit
        FROM journal_lines l
        JOIN journal_entries je ON je.id = l.journal_entry_id
-       WHERE l.account_id = $1 AND EXTRACT(YEAR FROM je.entry_date) = $2
+       WHERE l.account_id = $1 AND l.cooperative_id = $2 AND EXTRACT(YEAR FROM je.entry_date) = $3
        GROUP BY EXTRACT(MONTH FROM je.entry_date)
        ORDER BY month`,
-      [accountId, year],
+      [accountId, coopId, year],
     );
 
-    // Build all 12 months, filling zeros where no activity, running balance forward
     let runningBalance = bf;
     const months = [];
     for (let m = 1; m <= 12; m++) {

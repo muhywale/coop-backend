@@ -2,14 +2,15 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import pool from "../config/db.js";
 
-// REGISTER - member self-registers using email + phone to match their existing member record
 export const createMemberLogin = async (req, res) => {
   try {
     const { member_id, username, temp_password } = req.body;
+    const cooperativeId = req.user.cooperativeId; // the admin creating this login belongs to a cooperative
 
-    const member = await pool.query("SELECT * FROM members WHERE id = $1", [
-      member_id,
-    ]);
+    const member = await pool.query(
+      "SELECT * FROM members WHERE id = $1 AND cooperative_id = $2",
+      [member_id, cooperativeId],
+    );
     if (member.rows.length === 0) {
       return res.status(404).json({ error: "Member not found" });
     }
@@ -35,9 +36,9 @@ export const createMemberLogin = async (req, res) => {
     const password_hash = await bcrypt.hash(temp_password, 10);
 
     const result = await pool.query(
-      `INSERT INTO users (member_id, username, password_hash, must_change_password)
-       VALUES ($1, $2, $3, true) RETURNING id, member_id, username, role`,
-      [member_id, username, password_hash],
+      `INSERT INTO users (member_id, username, password_hash, must_change_password, cooperative_id)
+       VALUES ($1, $2, $3, true, $4) RETURNING id, member_id, username, role, cooperative_id`,
+      [member_id, username, password_hash, cooperativeId],
     );
 
     res.status(201).json(result.rows[0]);
@@ -63,7 +64,6 @@ export const changePassword = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
-
 export const login = async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -81,8 +81,12 @@ export const login = async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user.id, memberId: user.member_id, role: user.role },
-      // eslint-disable-next-line no-undef
+      {
+        userId: user.id,
+        memberId: user.member_id,
+        role: user.role,
+        cooperativeId: user.cooperative_id, // NEW
+      },
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
@@ -94,6 +98,7 @@ export const login = async (req, res) => {
         username: user.username,
         role: user.role,
         member_id: user.member_id,
+        cooperative_id: user.cooperative_id, // NEW
         must_change_password: user.must_change_password,
       },
     });

@@ -1,6 +1,6 @@
 export async function postJournal(
   client,
-  { entry_date, description, source, source_id, lines },
+  { entry_date, description, source, source_id, cooperativeId, lines },
 ) {
   const totalDebit = lines.reduce(
     (sum, l) => sum + (parseFloat(l.debit) || 0),
@@ -18,8 +18,9 @@ export async function postJournal(
   }
 
   const entryResult = await client.query(
-    `INSERT INTO journal_entries (entry_date, description, source, source_id) VALUES ($1, $2, $3, $4) RETURNING id`,
-    [entry_date, description, source, source_id],
+    `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id) 
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [entry_date, description, source, source_id, cooperativeId],
   );
   const entryId = entryResult.rows[0].id;
 
@@ -30,15 +31,23 @@ export async function postJournal(
     )
       continue;
     await client.query(
-      `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit) VALUES ($1, $2, $3, $4)`,
-      [entryId, line.account_id, line.debit || 0, line.credit || 0],
+      `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id) 
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        entryId,
+        line.account_id,
+        line.debit || 0,
+        line.credit || 0,
+        cooperativeId,
+      ],
     );
   }
 }
 
-export async function getDefaultCashAccount(client) {
+export async function getDefaultCashAccount(client, cooperativeId) {
   const result = await client.query(
-    "SELECT default_cash_account_id FROM settings LIMIT 1",
+    "SELECT default_cash_account_id FROM settings WHERE cooperative_id = $1",
+    [cooperativeId],
   );
   return result.rows[0].default_cash_account_id;
 }
