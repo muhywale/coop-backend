@@ -4,6 +4,10 @@ import {
   distributePayment,
   withdrawFunds,
   correctContribution,
+  bulkImportPayments,
+  bulkImportLoanRepayments,
+  bulkImportLoans,
+  bulkImportOpeningBalances,
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
@@ -17,4 +21,19 @@ router.delete(
   correctContribution,
 );
 
+router.post("/bulk-import", verifyToken, requireAdmin, bulkImportPayments);
+router.post(
+  "/bulk-import-loan-repayments",
+  verifyToken,
+  requireAdmin,
+  bulkImportLoanRepayments,
+);
+
+router.post("/bulk-import-loans", verifyToken, requireAdmin, bulkImportLoans);
 export default router;
+router.post(
+  "/bulk-import-opening-balances",
+  verifyToken,
+  requireAdmin,
+  bulkImportOpeningBalances,
+);

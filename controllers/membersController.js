@@ -311,7 +311,7 @@ export const getMemberAccountsLedger = async (req, res) => {
       loanBfMap[r.product_id] = parseFloat(r.bf);
     });
 
-    const buildBlocks = (rows, bfLookup) => {
+    const buildBlocks = (rows, bfLookup, normalBalance = "credit") => {
       const byProduct = {};
       rows.forEach((r) => {
         if (!byProduct[r.product_id]) {
@@ -338,17 +338,20 @@ export const getMemberAccountsLedger = async (req, res) => {
         const periods = Object.values(block.periods)
           .sort((a, b) => new Date(a.period) - new Date(b.period))
           .map((p) => {
-            running += p.cr - p.dr;
+            // Debit-normal (loans): DR increases balance, CR decreases it
+            // Credit-normal (savings): CR increases balance, DR decreases it
+            running += normalBalance === "debit" ? p.dr - p.cr : p.cr - p.dr;
             return { period: p.period, dr: p.dr, cr: p.cr, balance: running };
           });
         return { product_name: block.product_name, bf: block.bf, periods };
       });
     };
 
-    const savingsBlocks = buildBlocks(savingsResult.rows, bfMap);
+    const savingsBlocks = buildBlocks(savingsResult.rows, bfMap, "credit");
     const loanBlocks = buildBlocks(
       [...loanDrResult.rows, ...loanCrResult.rows],
       loanBfMap,
+      "debit",
     );
 
     res.json({ savings: savingsBlocks, loans: loanBlocks });

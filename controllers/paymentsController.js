@@ -257,3 +257,382 @@ export const correctContribution = async (req, res) => {
     client.release();
   }
 };
+export const bulkImportPayments = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, columnMap } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    const members = await client.query(
+      "SELECT id, full_name FROM members WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const memberMap = {};
+    members.rows.forEach((m) => {
+      memberMap[m.full_name.trim().toLowerCase()] = m.id;
+    });
+
+    const cashAccountId = await getDefaultCashAccount(client, coopId);
+    const productsResult = await client.query(
+      "SELECT id, linked_account_id, name, category FROM products WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const productMap = {};
+    productsResult.rows.forEach((p) => {
+      productMap[p.id] = p;
+    });
+
+    let inserted = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const memberId = memberMap[row.member_name?.trim().toLowerCase()];
+      if (!memberId) {
+        skipped.push({ row: row.member_name, reason: "Member not found" });
+        continue;
+      }
+
+      for (const [excelColumn, productId] of Object.entries(columnMap)) {
+        const amount = parseFloat(row[excelColumn]);
+        if (!amount || amount <= 0 || !productId) continue;
+
+        const product = productMap[productId];
+        if (!product) continue;
+
+        // Use the product's real category as the contribution type
+        const type = product.category === "other" ? "other" : "savings";
+
+        await client.query(
+          `INSERT INTO contributions (member_id, amount, type, contribution_date, product_id, cooperative_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [memberId, amount, type, row.date, productId, coopId],
+        );
+
+        if (product.linked_account_id) {
+          await postJournal(client, {
+            entry_date: row.date,
+            description: `${product.name} — imported from Excel (${row.member_name})`,
+            source: "contribution",
+            source_id: memberId,
+            cooperativeId: coopId,
+            lines: [
+              { account_id: cashAccountId, debit: amount, credit: 0 },
+              {
+                account_id: product.linked_account_id,
+                debit: 0,
+                credit: amount,
+              },
+            ],
+          });
+        }
+        inserted++;
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ message: `Imported ${inserted} entries`, skipped });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const bulkImportLoanRepayments = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, loanRepColumn, productId } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    const members = await client.query(
+      "SELECT id, full_name FROM members WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const memberMap = {};
+    members.rows.forEach((m) => {
+      memberMap[m.full_name.trim().toLowerCase()] = m.id;
+    });
+
+    const cashAccountId = await getDefaultCashAccount(client, coopId);
+
+    let inserted = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const amount = parseFloat(row[loanRepColumn]);
+      if (!amount || amount <= 0) continue;
+
+      const memberId = memberMap[row.member_name?.trim().toLowerCase()];
+      if (!memberId) {
+        skipped.push({
+          member: row.member_name,
+          amount,
+          reason: "Member not found",
+        });
+        continue;
+      }
+
+      // Look for an active loan for THIS SPECIFIC product, not just any active loan
+      const loanResult = await client.query(
+        `SELECT l.id, p.linked_account_id, p.name
+         FROM loans l JOIN products p ON l.product_id = p.id
+         WHERE l.member_id = $1 AND l.product_id = $2 AND l.status = 'active' AND l.cooperative_id = $3
+         ORDER BY l.date_issued DESC LIMIT 1`,
+        [memberId, productId, coopId],
+      );
+
+      if (loanResult.rows.length === 0) {
+        skipped.push({
+          member: row.member_name,
+          amount,
+          reason: "No active loan of this product found",
+        });
+        continue;
+      }
+
+      const loan = loanResult.rows[0];
+
+      await client.query(
+        `INSERT INTO loan_repayments (loan_id, amount, repayment_date, cooperative_id) VALUES ($1, $2, $3, $4)`,
+        [loan.id, amount, row.date, coopId],
+      );
+
+      if (loan.linked_account_id) {
+        await postJournal(client, {
+          entry_date: row.date,
+          description: `${loan.name} repayment — ${row.member_name} (imported)`,
+          source: "repayment",
+          source_id: loan.id,
+          cooperativeId: coopId,
+          lines: [
+            { account_id: cashAccountId, debit: amount, credit: 0 },
+            { account_id: loan.linked_account_id, debit: 0, credit: amount },
+          ],
+        });
+      }
+
+      const totals = await client.query(
+        `SELECT l.principal, COALESCE(SUM(r.amount), 0) AS total_repaid
+         FROM loans l LEFT JOIN loan_repayments r ON r.loan_id = l.id
+         WHERE l.id = $1 GROUP BY l.principal`,
+        [loan.id],
+      );
+      if (
+        parseFloat(totals.rows[0].total_repaid) >=
+        parseFloat(totals.rows[0].principal)
+      ) {
+        await client.query(`UPDATE loans SET status = 'paid' WHERE id = $1`, [
+          loan.id,
+        ]);
+      }
+
+      inserted++;
+    }
+
+    await client.query("COMMIT");
+    res.json({ message: `Imported ${inserted} loan repayments`, skipped });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+
+export const bulkImportLoans = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, productId } = req.body;
+    // rows: [{ date, member_name, amount }, ...]
+    // productId: which loan product these all belong to (e.g. "Ordinary Loan")
+    const coopId = req.user.cooperativeId;
+
+    const members = await client.query(
+      "SELECT id, full_name FROM members WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const memberMap = {};
+    members.rows.forEach((m) => {
+      memberMap[m.full_name.trim().toLowerCase()] = m.id;
+    });
+
+    const product = await client.query(
+      "SELECT id, name, interest_rate, linked_account_id FROM products WHERE id = $1 AND cooperative_id = $2",
+      [productId, coopId],
+    );
+    if (product.rows.length === 0) {
+      return res.status(404).json({ error: "Loan product not found" });
+    }
+    const {
+      name: productName,
+      interest_rate,
+      linked_account_id,
+    } = product.rows[0];
+
+    const cashAccountId = await getDefaultCashAccount(client, coopId);
+
+    let inserted = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const amount = parseFloat(row.amount);
+      if (!amount || amount <= 0) continue;
+
+      const memberId = memberMap[row.member_name?.trim().toLowerCase()];
+      if (!memberId) {
+        skipped.push({
+          member: row.member_name,
+          amount,
+          reason: "Member not found",
+        });
+        continue;
+      }
+
+      const loanResult = await client.query(
+        `INSERT INTO loans (member_id, principal, interest_rate, date_issued, status, product_id, cooperative_id)
+         VALUES ($1, $2, $3, $4, 'active', $5, $6) RETURNING id`,
+        [memberId, amount, interest_rate, row.date, productId, coopId],
+      );
+
+      if (linked_account_id) {
+        await postJournal(client, {
+          entry_date: row.date,
+          description: `${productName} issued — ${row.member_name} (imported)`,
+          source: "loan",
+          source_id: loanResult.rows[0].id,
+          cooperativeId: coopId,
+          lines: [
+            { account_id: linked_account_id, debit: amount, credit: 0 },
+            { account_id: cashAccountId, debit: 0, credit: amount },
+          ],
+        });
+      }
+
+      inserted++;
+    }
+
+    await client.query("COMMIT");
+    res.json({ message: `Imported ${inserted} loans`, skipped });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const bulkImportOpeningBalances = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, columnMap, asAtDate } = req.body;
+    // columnMap now includes BOTH savings and loan products mixed together
+    const coopId = req.user.cooperativeId;
+
+    const members = await client.query(
+      "SELECT id, full_name FROM members WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const memberMap = {};
+    members.rows.forEach((m) => {
+      memberMap[m.full_name.trim().toLowerCase()] = m.id;
+    });
+
+    const productsResult = await client.query(
+      "SELECT id, category, interest_rate, linked_account_id, name FROM products WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const productMap = {};
+    productsResult.rows.forEach((p) => {
+      productMap[p.id] = p;
+    });
+
+    let inserted = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const memberId = memberMap[row.member_name?.trim().toLowerCase()];
+      if (!memberId) {
+        skipped.push({ row: row.member_name, reason: "Member not found" });
+        continue;
+      }
+
+      for (const [excelColumn, productId] of Object.entries(columnMap)) {
+        const amount = parseFloat(row[excelColumn]);
+        if (!amount || amount <= 0 || !productId) continue;
+
+        const product = productMap[productId];
+        if (!product) continue;
+
+        if (product.category === "loan") {
+          // Check for an existing opening loan of this product to avoid duplicates
+          const existing = await client.query(
+            `SELECT id FROM loans WHERE member_id = $1 AND product_id = $2 AND date_issued = $3 AND cooperative_id = $4`,
+            [memberId, productId, asAtDate, coopId],
+          );
+          if (existing.rows.length > 0) {
+            skipped.push({
+              member: row.member_name,
+              column: excelColumn,
+              reason: "Opening loan already exists",
+            });
+            continue;
+          }
+
+          await client.query(
+            `INSERT INTO loans (member_id, principal, interest_rate, date_issued, status, product_id, cooperative_id)
+             VALUES ($1, $2, $3, $4, 'active', $5, $6)`,
+            [
+              memberId,
+              amount,
+              product.interest_rate || 0,
+              asAtDate,
+              productId,
+              coopId,
+            ],
+          );
+        } else {
+          // Savings/other — same as before
+          const existing = await client.query(
+            `SELECT id FROM contributions WHERE member_id = $1 AND product_id = $2 AND type = 'opening_balance' AND cooperative_id = $3`,
+            [memberId, productId, coopId],
+          );
+          if (existing.rows.length > 0) {
+            skipped.push({
+              member: row.member_name,
+              column: excelColumn,
+              reason: "Opening balance already exists",
+            });
+            continue;
+          }
+
+          await client.query(
+            `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id, cooperative_id)
+             VALUES ($1, $2, 'opening_balance', $3, 'Opening balance import', $4, $5)`,
+            [memberId, amount, asAtDate, productId, coopId],
+          );
+        }
+
+        inserted++;
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ message: `Imported ${inserted} opening balances`, skipped });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
