@@ -10,6 +10,7 @@ import dashboardRoutes from "./routes/dashboard.js";
 import paymentsRoutes from "./routes/payments.js";
 import journalRoutes from "./routes/journal.js";
 import superAdminRoutes from "./routes/superAdmin.js";
+import chartOfAccountsRoutes from "./routes/chartOfAccounts.js";
 
 dotenv.config();
 
@@ -42,6 +43,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/journal", journalRoutes);
 app.use("/api/super-admin", superAdminRoutes);
+app.use("/api/chart-of-accounts", chartOfAccountsRoutes);
 
 // eslint-disable-next-line no-undef
 console.log("JWT_SECRET is", process.env.JWT_SECRET);

@@ -15,11 +15,12 @@ export const distributePayment = async (req, res) => {
     if (savings && typeof savings === "object") {
       for (const [productId, amount] of Object.entries(savings)) {
         if (amount && parseFloat(amount) > 0) {
-          await client.query(
+          const contributionResult = await client.query(
             `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id, cooperative_id)
-             VALUES ($1, $2, 'savings', $3, $4, $5, $6)`,
+             VALUES ($1, $2, 'savings', $3, $4, $5, $6) RETURNING id`,
             [member_id, amount, date, notes || null, productId, coopId],
           );
+          const contributionId = contributionResult.rows[0].id;
 
           const product = await client.query(
             "SELECT linked_account_id, name FROM products WHERE id = $1 AND cooperative_id = $2",
@@ -31,7 +32,7 @@ export const distributePayment = async (req, res) => {
               entry_date: date,
               description: `${product.rows[0].name} deposit — member ${member_id}`,
               source: "contribution",
-              source_id: member_id,
+              source_id: contributionId,
               cooperativeId: coopId,
               lines: [
                 { account_id: cashAccountId, debit: amount, credit: 0 },
@@ -47,11 +48,12 @@ export const distributePayment = async (req, res) => {
     if (other && typeof other === "object") {
       for (const [productId, amount] of Object.entries(other)) {
         if (amount && parseFloat(amount) > 0) {
-          await client.query(
+          const contributionResult = await client.query(
             `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id, cooperative_id)
-             VALUES ($1, $2, 'other', $3, $4, $5, $6)`,
+             VALUES ($1, $2, 'other', $3, $4, $5, $6) RETURNING id`,
             [member_id, amount, date, notes || null, productId, coopId],
           );
+          const contributionId = contributionResult.rows[0].id;
 
           const product = await client.query(
             "SELECT linked_account_id, name FROM products WHERE id = $1 AND cooperative_id = $2",
@@ -63,7 +65,7 @@ export const distributePayment = async (req, res) => {
               entry_date: date,
               description: `${product.rows[0].name} — member ${member_id}`,
               source: "contribution",
-              source_id: member_id,
+              source_id: contributionId,
               cooperativeId: coopId,
               lines: [
                 { account_id: cashAccountId, debit: amount, credit: 0 },
@@ -159,11 +161,12 @@ export const withdrawFunds = async (req, res) => {
       });
     }
 
-    await client.query(
+    const contributionResult = await client.query(
       `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id, cooperative_id)
-       VALUES ($1, $2, 'withdrawal', $3, $4, $5, $6)`,
+       VALUES ($1, $2, 'withdrawal', $3, $4, $5, $6) RETURNING id`,
       [member_id, amount, date, notes || null, product_id, coopId],
     );
+    const contributionId = contributionResult.rows[0].id;
 
     const product = await client.query(
       "SELECT linked_account_id, name FROM products WHERE id = $1 AND cooperative_id = $2",
@@ -177,7 +180,7 @@ export const withdrawFunds = async (req, res) => {
         entry_date: date,
         description: `${product.rows[0].name} withdrawal — member ${member_id}`,
         source: "withdrawal",
-        source_id: member_id,
+        source_id: contributionId,
         cooperativeId: coopId,
         lines: [
           { account_id: accountId, debit: amount, credit: 0 },
@@ -214,7 +217,7 @@ export const correctContribution = async (req, res) => {
     }
 
     const journalEntry = await client.query(
-      `SELECT id FROM journal_entries WHERE source = 'contribution' AND source_id = $1 AND cooperative_id = $2`,
+      `SELECT id FROM journal_entries WHERE source IN ('contribution','withdrawal') AND source_id = $1 AND cooperative_id = $2`,
       [id, coopId],
     );
     if (journalEntry.rows.length > 0) {
@@ -257,6 +260,7 @@ export const correctContribution = async (req, res) => {
     client.release();
   }
 };
+
 export const bulkImportPayments = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -301,21 +305,21 @@ export const bulkImportPayments = async (req, res) => {
         const product = productMap[productId];
         if (!product) continue;
 
-        // Use the product's real category as the contribution type
         const type = product.category === "other" ? "other" : "savings";
 
-        await client.query(
+        const contributionResult = await client.query(
           `INSERT INTO contributions (member_id, amount, type, contribution_date, product_id, cooperative_id)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
           [memberId, amount, type, row.date, productId, coopId],
         );
+        const contributionId = contributionResult.rows[0].id;
 
         if (product.linked_account_id) {
           await postJournal(client, {
             entry_date: row.date,
             description: `${product.name} — imported from Excel (${row.member_name})`,
             source: "contribution",
-            source_id: memberId,
+            source_id: contributionId,
             cooperativeId: coopId,
             lines: [
               { account_id: cashAccountId, debit: amount, credit: 0 },
@@ -341,6 +345,7 @@ export const bulkImportPayments = async (req, res) => {
     client.release();
   }
 };
+
 export const bulkImportLoanRepayments = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -377,7 +382,6 @@ export const bulkImportLoanRepayments = async (req, res) => {
         continue;
       }
 
-      // Look for an active loan for THIS SPECIFIC product, not just any active loan
       const loanResult = await client.query(
         `SELECT l.id, p.linked_account_id, p.name
          FROM loans l JOIN products p ON l.product_id = p.id
@@ -449,8 +453,6 @@ export const bulkImportLoans = async (req, res) => {
   const client = await pool.connect();
   try {
     const { rows, productId } = req.body;
-    // rows: [{ date, member_name, amount }, ...]
-    // productId: which loan product these all belong to (e.g. "Ordinary Loan")
     const coopId = req.user.cooperativeId;
 
     const members = await client.query(
@@ -529,11 +531,11 @@ export const bulkImportLoans = async (req, res) => {
     client.release();
   }
 };
+
 export const bulkImportOpeningBalances = async (req, res) => {
   const client = await pool.connect();
   try {
     const { rows, columnMap, asAtDate } = req.body;
-    // columnMap now includes BOTH savings and loan products mixed together
     const coopId = req.user.cooperativeId;
 
     const members = await client.query(
@@ -574,7 +576,6 @@ export const bulkImportOpeningBalances = async (req, res) => {
         if (!product) continue;
 
         if (product.category === "loan") {
-          // Check for an existing opening loan of this product to avoid duplicates
           const existing = await client.query(
             `SELECT id FROM loans WHERE member_id = $1 AND product_id = $2 AND date_issued = $3 AND cooperative_id = $4`,
             [memberId, productId, asAtDate, coopId],
@@ -601,7 +602,6 @@ export const bulkImportOpeningBalances = async (req, res) => {
             ],
           );
         } else {
-          // Savings/other — same as before
           const existing = await client.query(
             `SELECT id FROM contributions WHERE member_id = $1 AND product_id = $2 AND type = 'opening_balance' AND cooperative_id = $3`,
             [memberId, productId, coopId],
@@ -636,11 +636,11 @@ export const bulkImportOpeningBalances = async (req, res) => {
     client.release();
   }
 };
+
 export const bulkImportOpeningTrialBalance = async (req, res) => {
   const client = await pool.connect();
   try {
     const { rows, codeColumn, debitColumn, creditColumn, asAtDate } = req.body;
-    // rows: parsed Excel rows, each expected to have a code, debit amount, credit amount
     const coopId = req.user.cooperativeId;
 
     const accountsResult = await client.query(
@@ -691,18 +691,15 @@ export const bulkImportOpeningTrialBalance = async (req, res) => {
       });
     }
 
-    // Check if an opening balance entry already exists for this date, to avoid duplicates
     const existing = await client.query(
       `SELECT id FROM journal_entries WHERE source = 'opening_balance' AND entry_date = $1 AND cooperative_id = $2`,
       [asAtDate, coopId],
     );
     if (existing.rows.length > 0) {
-      return res
-        .status(409)
-        .json({
-          error:
-            "An opening trial balance for this date already exists. Delete it first if you need to re-import.",
-        });
+      return res.status(409).json({
+        error:
+          "An opening trial balance for this date already exists. Delete it first if you need to re-import.",
+      });
     }
 
     await client.query("BEGIN");
