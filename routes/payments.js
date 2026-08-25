@@ -8,6 +8,7 @@ import {
   bulkImportLoanRepayments,
   bulkImportLoans,
   bulkImportOpeningBalances,
+  bulkImportOpeningTrialBalance,
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
@@ -36,4 +37,10 @@ router.post(
   verifyToken,
   requireAdmin,
   bulkImportOpeningBalances,
+);
+router.post(
+  "/bulk-import-opening-trial-balance",
+  verifyToken,
+  requireAdmin,
+  bulkImportOpeningTrialBalance,
 );

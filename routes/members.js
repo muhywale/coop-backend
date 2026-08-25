@@ -23,6 +23,7 @@ router.get("/me/detail", verifyToken, getMyDetail);
 router.get("/me/ledger", verifyToken, getMyLedger);
 router.get("/me/detail", verifyToken, getMyDetail);
 router.get("/me/transactions", verifyToken, getMyTransactions);
+router.get("/me/accounts-ledger", verifyToken, getMyAccountsLedger);
 router.get("/:id", verifyToken, getMemberById);
 router.post("/", verifyToken, createMember);
 router.put("/:id", verifyToken, updateMember);
@@ -36,6 +37,5 @@ router.get(
   requireAdmin,
   getMemberAccountsLedger,
 );
-router.get("/me/accounts-ledger", verifyToken, getMyAccountsLedger);
 
 export default router;

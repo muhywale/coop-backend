@@ -636,3 +636,101 @@ export const bulkImportOpeningBalances = async (req, res) => {
     client.release();
   }
 };
+export const bulkImportOpeningTrialBalance = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, codeColumn, debitColumn, creditColumn, asAtDate } = req.body;
+    // rows: parsed Excel rows, each expected to have a code, debit amount, credit amount
+    const coopId = req.user.cooperativeId;
+
+    const accountsResult = await client.query(
+      "SELECT id, code FROM chart_of_accounts WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const accountMap = {};
+    accountsResult.rows.forEach((a) => {
+      accountMap[a.code] = a.id;
+    });
+
+    const lines = [];
+    const skipped = [];
+    let totalDebit = 0;
+    let totalCredit = 0;
+
+    for (const row of rows) {
+      const code = String(row[codeColumn]).trim();
+      const debit = parseFloat(row[debitColumn]) || 0;
+      const credit = parseFloat(row[creditColumn]) || 0;
+      if (debit === 0 && credit === 0) continue;
+
+      const accountId = accountMap[code];
+      if (!accountId) {
+        skipped.push({
+          code,
+          debit,
+          credit,
+          reason: "Account code not found in Chart of Accounts",
+        });
+        continue;
+      }
+
+      if (debit > 0) {
+        lines.push({ account_id: accountId, debit, credit: 0 });
+        totalDebit += debit;
+      }
+      if (credit > 0) {
+        lines.push({ account_id: accountId, debit: 0, credit });
+        totalCredit += credit;
+      }
+    }
+
+    if (Math.abs(totalDebit - totalCredit) > 1) {
+      return res.status(400).json({
+        error: `Does not balance — total debit ${totalDebit.toLocaleString()}, total credit ${totalCredit.toLocaleString()}. Check your source figures before importing.`,
+        skipped,
+      });
+    }
+
+    // Check if an opening balance entry already exists for this date, to avoid duplicates
+    const existing = await client.query(
+      `SELECT id FROM journal_entries WHERE source = 'opening_balance' AND entry_date = $1 AND cooperative_id = $2`,
+      [asAtDate, coopId],
+    );
+    if (existing.rows.length > 0) {
+      return res
+        .status(409)
+        .json({
+          error:
+            "An opening trial balance for this date already exists. Delete it first if you need to re-import.",
+        });
+    }
+
+    await client.query("BEGIN");
+    const entryResult = await client.query(
+      `INSERT INTO journal_entries (entry_date, description, source, cooperative_id)
+       VALUES ($1, 'Opening trial balance (imported)', 'opening_balance', $2) RETURNING id`,
+      [asAtDate, coopId],
+    );
+    const entryId = entryResult.rows[0].id;
+
+    for (const line of lines) {
+      await client.query(
+        `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [entryId, line.account_id, line.debit, line.credit, coopId],
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Opening trial balance posted successfully — ${lines.length} lines, ₦${totalDebit.toLocaleString()} balanced`,
+      skipped,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
