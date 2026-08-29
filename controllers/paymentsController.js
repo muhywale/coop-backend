@@ -9,6 +9,24 @@ export const distributePayment = async (req, res) => {
     const coopId = req.user.cooperativeId;
     await client.query("BEGIN");
 
+    const allProductIds = [
+      ...Object.keys(savings || {}),
+      ...Object.keys(other || {}),
+    ];
+    if (allProductIds.length > 0) {
+      const productsCheck = await client.query(
+        `SELECT id, name, linked_account_id FROM products WHERE id = ANY($1::int[]) AND cooperative_id = $2`,
+        [allProductIds.map(Number), coopId],
+      );
+      const unlinked = productsCheck.rows.filter((p) => !p.linked_account_id);
+      if (unlinked.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Cannot record payment: the following products are not linked to a ledger account yet — ${unlinked.map((p) => p.name).join(", ")}. Link them in Chart of Accounts / Products settings first.`,
+        });
+      }
+    }
+
     const cashAccountId = await getDefaultCashAccount(client, coopId);
 
     // Savings deposits
