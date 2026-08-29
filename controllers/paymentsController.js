@@ -731,3 +731,71 @@ export const bulkImportOpeningTrialBalance = async (req, res) => {
     client.release();
   }
 };
+export const bulkImportMembers = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, nameColumn, memberNumberColumn } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    let inserted = 0;
+    let updated = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const fullName = row[nameColumn]?.trim();
+      const memberNumber = memberNumberColumn
+        ? row[memberNumberColumn]?.toString().trim()
+        : null;
+
+      if (!fullName) {
+        skipped.push({ row, reason: "Missing name" });
+        continue;
+      }
+
+      // Check if this member already exists (by name) in this cooperative
+      const existing = await client.query(
+        `SELECT id, member_number FROM members WHERE full_name = $1 AND cooperative_id = $2`,
+        [fullName, coopId],
+      );
+
+      if (existing.rows.length > 0) {
+        // Already exists — update their member_number if we have one and they don't already
+        if (memberNumber && !existing.rows[0].member_number) {
+          await client.query(
+            `UPDATE members SET member_number = $1 WHERE id = $2`,
+            [memberNumber, existing.rows[0].id],
+          );
+          updated++;
+        } else {
+          skipped.push({ name: fullName, reason: "Member already exists" });
+        }
+        continue;
+      }
+
+      // New member — create with number if provided
+      try {
+        await client.query(
+          `INSERT INTO members (full_name, member_number, cooperative_id) VALUES ($1, $2, $3)`,
+          [fullName, memberNumber, coopId],
+        );
+        inserted++;
+      } catch (err) {
+        skipped.push({ name: fullName, reason: err.message });
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Imported ${inserted} new members, updated ${updated} existing`,
+      skipped,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};

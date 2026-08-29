@@ -35,14 +35,19 @@ export const getMemberById = async (req, res) => {
 // POST create new member
 export const createMember = async (req, res) => {
   try {
-    const { full_name, email, phone } = req.body;
+    const { full_name, email, phone, member_number } = req.body;
     const result = await pool.query(
-      "INSERT INTO members (full_name, email, phone, cooperative_id) VALUES ($1, $2, $3, $4) RETURNING *",
-      [full_name, email, phone, req.user.cooperativeId],
+      "INSERT INTO members (full_name, email, phone, member_number, cooperative_id) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+      [full_name, email, phone, member_number || null, req.user.cooperativeId],
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err.message);
+    if (err.code === "23505") {
+      return res.status(409).json({
+        error: `Member number "${req.body.member_number}" already exists in this cooperative`,
+      });
+    }
     res.status(500).json({ error: "Server error" });
   }
 };
@@ -51,10 +56,18 @@ export const createMember = async (req, res) => {
 export const updateMember = async (req, res) => {
   try {
     const { id } = req.params;
-    const { full_name, email, phone, status } = req.body;
+    const { full_name, email, phone, member_number, status } = req.body;
     const result = await pool.query(
-      "UPDATE members SET full_name=$1, email=$2, phone=$3, status=$4 WHERE id=$5 AND cooperative_id=$6 RETURNING *",
-      [full_name, email, phone, status, id, req.user.cooperativeId],
+      "UPDATE members SET full_name=$1, email=$2, phone=$3, status=$4, member_number=$5 WHERE id=$6 AND cooperative_id=$7 RETURNING *",
+      [
+        full_name,
+        email,
+        phone,
+        member_number,
+        status,
+        id,
+        req.user.cooperativeId,
+      ],
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Member not found" });
