@@ -20,7 +20,7 @@ dotenv.config();
 const app = express();
 
 const allowedOrigins = [
-  "http://localhost:3000",
+  // "http://localhost:3000",
   "https://coop-frontend-xi.vercel.app",
 ];
 app.use(express.json({ limit: "10mb" }));
@@ -37,11 +37,9 @@ const loginLimiter = rateLimit({
   max: 5,
   handler: (req, res) => {
     console.log("Rate limit triggered for:", req.ip);
-    res
-      .status(429)
-      .json({
-        error: "Too many login attempts. Please try again in 15 minutes.",
-      });
+    res.status(429).json({
+      error: "Too many login attempts. Please try again in 15 minutes.",
+    });
   },
 });
 
@@ -56,7 +54,6 @@ app.use("/api/auth/change-password", changePasswordLimiter);
 
 app.use("/api/members", membersRoutes);
 app.use("/api/contributions", contributionsRoutes);
-app.use("/api/loans", loansRoutes);
 app.use("/api/loans", loansRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/products", productsRoutes);
