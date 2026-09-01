@@ -85,20 +85,28 @@ export const login = async (req, res) => {
         userId: user.id,
         memberId: user.member_id,
         role: user.role,
-        cooperativeId: user.cooperative_id, // NEW
+        cooperativeId: user.cooperative_id,
       },
+      // eslint-disable-next-line no-undef
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
 
+    res.cookie("token", token, {
+      httpOnly: true,
+      // eslint-disable-next-line no-undef
+      secure: process.env.NODE_ENV === "production", // HTTPS only in production
+      sameSite: "strict",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    });
+
     res.json({
-      token,
       user: {
         id: user.id,
         username: user.username,
         role: user.role,
         member_id: user.member_id,
-        cooperative_id: user.cooperative_id, // NEW
+        cooperative_id: user.cooperative_id,
         must_change_password: user.must_change_password,
       },
     });

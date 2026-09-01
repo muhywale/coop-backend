@@ -1,5 +1,7 @@
 import express from "express";
 import { verifyToken, requireAdmin } from "../middleware/auth.js";
+import { body, validationResult } from "express-validator";
+
 import {
   distributePayment,
   withdrawFunds,
@@ -13,9 +15,29 @@ import {
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
-router.post("/distribute", verifyToken, requireAdmin, distributePayment);
-router.post("/withdraw", verifyToken, requireAdmin, withdrawFunds);
 
+const handleValidation = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0].msg });
+  }
+  next();
+};
+
+const validateDistribute = [
+  body("member_id").isInt({ min: 1 }).withMessage("Valid member is required"),
+  body("date").isISO8601().withMessage("Valid date is required"),
+];
+
+router.post(
+  "/distribute",
+  verifyToken,
+  requireAdmin,
+  validateDistribute,
+  handleValidation,
+  distributePayment,
+);
+router.post("/withdraw", verifyToken, requireAdmin, withdrawFunds);
 router.delete(
   "/contributions/:id/correct",
   verifyToken,
