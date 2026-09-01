@@ -38,7 +38,6 @@ const handleValidation = (req, res, next) => {
   }
   next();
 };
-router.get("/", verifyToken, getMembers);
 
 router.get("/me/detail", verifyToken, getMyDetail);
 router.get("/me/ledger", verifyToken, getMyLedger);
@@ -57,6 +56,7 @@ router.get(
 );
 router.get("/:id", verifyToken, getMemberById);
 router.put("/:id", verifyToken, updateMember);
+router.get("/", verifyToken, getMembers);
 
 router.post(
   "/",
