@@ -19,10 +19,10 @@ dotenv.config();
 
 const app = express();
 
-const allowedOrigins = [
-  "http://localhost:3000",
-  "https://coop-frontend-xi.vercel.app",
-];
+//const allowedOrigins = [
+//"http://localhost:3000",
+//"https://coop-frontend-xi.vercel.app",
+//];
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 app.use(
