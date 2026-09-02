@@ -50,8 +50,8 @@ const changePasswordLimiter = rateLimit({
 });
 
 app.use("/api/auth/login", loginLimiter);
-app.use("/api/auth/change-password", changePasswordLimiter);
 app.use("/api/auth", authRoutes);
+app.use("/api/auth/change-password", changePasswordLimiter);
 
 app.use("/api/members", membersRoutes);
 app.use("/api/contributions", contributionsRoutes);
