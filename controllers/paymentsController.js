@@ -102,10 +102,12 @@ export const distributePayment = async (req, res) => {
           "Loan selected required when entering a loan repayment amount",
         );
 
-      await client.query(
-        `INSERT INTO loan_repayments (loan_id, amount, repayment_date, cooperative_id) VALUES ($1, $2, $3, $4)`,
+      const repaymentResult = await client.query(
+        `INSERT INTO loan_repayments (loan_id, amount, repayment_date, cooperative_id) VALUES ($1, $2, $3, $4) RETURNING id`,
         [loan_id, loan_repayment, date, coopId],
       );
+
+      const repaymentId = repaymentResult.rows[0].id;
 
       const loanRow = await client.query(
         `SELECT l.principal, l.product_id, COALESCE(SUM(r.amount), 0) AS total_repaid
@@ -131,7 +133,7 @@ export const distributePayment = async (req, res) => {
           entry_date: date,
           description: `Loan repayment — loan #${loan_id}`,
           source: "repayment",
-          source_id: loan_id,
+          source_id: repaymentId,
           cooperativeId: coopId,
           lines: [
             { account_id: cashAccountId, debit: loan_repayment, credit: 0 },
@@ -809,6 +811,217 @@ export const bulkImportMembers = async (req, res) => {
       message: `Imported ${inserted} new members, updated ${updated} existing`,
       skipped,
     });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const editContributionAmount = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { new_amount } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    if (!new_amount || parseFloat(new_amount)) {
+      return res.status(400).json({ error: "Enter a valid amount" });
+    }
+
+    await client.query("BEGIN");
+
+    const contribution = await client.query(
+      "SELECT * FROM contributions WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    if (contribution.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+
+    // Update the contribution's amount directly
+    await client.query(
+      "UPDATE contributions SET amount = $1 WHERE id = $2 AND cooperative_id = $3",
+      [new_amount, id, coopId],
+    );
+
+    // Find the matching journal entry and adjust its lines to the new amount
+    const journalEntry = await client.query(
+      `SELECT id FROM journal_entries WHERE source IN ('contribution','withdrawal') AND source_id = $1 AND cooperative_id = $2`,
+      [id, coopId],
+    );
+
+    if (journalEntry.rows.length > 0) {
+      const entryId = journalEntry.rows[0].id;
+      const lines = await client.query(
+        "SELECT * FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+        [entryId, coopId],
+      );
+
+      // Each line's debit/credit gets rescaled to the new amount (preserving which side each account was on)
+      for (const line of lines.rows) {
+        const newDebit = parseFloat(line.debit) > 0 ? new_amount : 0;
+        const newCredit = parseFloat(line.credit) > 0 ? new_amount : 0;
+        await client.query(
+          "UPDATE journal_lines SET debit = $1, credit = $2 WHERE id = $3",
+          [newDebit, newCredit, line.id],
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Amount updated to ₦${parseFloat(new_amount).toLocaleString()}`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const editRepaymentAmount = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { new_amount } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    if (!new_amount || parseFloat(new_amount)) {
+      return res.status(400).json({ error: "Enter a valid amount" });
+    }
+
+    await client.query("BEGIN");
+
+    const repayment = await client.query(
+      "SELECT * FROM loan_repayments WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    if (repayment.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Repayment not found" });
+    }
+
+    await client.query(
+      "UPDATE loan_repayments SET amount = $1 WHERE id = $2 AND cooperative_id = $3",
+      [new_amount, id, coopId],
+    );
+
+    const journalEntry = await client.query(
+      `SELECT id FROM journal_entries WHERE source = 'repayment' AND source_id = $1 AND cooperative_id = $2`,
+      [repayment.rows[0].loan_id, coopId],
+    );
+
+    // Note: repayment journal entries are keyed by loan_id, not repayment id — see caveat below
+    if (journalEntry.rows.length > 0) {
+      const entryId = journalEntry.rows[0].id;
+      const lines = await client.query(
+        "SELECT * FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+        [entryId, coopId],
+      );
+      for (const line of lines.rows) {
+        const newDebit = parseFloat(line.debit) > 0 ? new_amount : 0;
+        const newCredit = parseFloat(line.credit) > 0 ? new_amount : 0;
+        await client.query(
+          "UPDATE journal_lines SET debit = $1, credit = $2 WHERE id = $3",
+          [newDebit, newCredit, line.id],
+        );
+      }
+    }
+
+    // Re-check loan status — correcting the amount might change whether it's now fully paid or not
+    const totals = await client.query(
+      `SELECT l.principal, COALESCE(SUM(r.amount), 0) AS total_repaid
+       FROM loans l LEFT JOIN loan_repayments r ON r.loan_id = l.id
+       WHERE l.id = $1 GROUP BY l.principal`,
+      [repayment.rows[0].loan_id],
+    );
+    const isPaid =
+      parseFloat(totals.rows[0].total_repaid) >=
+      parseFloat(totals.rows[0].principal);
+    await client.query(
+      `UPDATE loans SET status = $1 WHERE id = $2 AND cooperative_id = $3`,
+      [isPaid ? "paid" : "active", repayment.rows[0].loan_id, coopId],
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Repayment amount updated to ₦${parseFloat(new_amount).toLocaleString()}`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const deleteRepayment = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const coopId = req.user.cooperativeId;
+    await client.query("BEGIN");
+
+    const repayment = await client.query(
+      "SELECT * FROM loan_repayments WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    if (repayment.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Repayment not found" });
+    }
+
+    const journalEntry = await client.query(
+      `SELECT id FROM journal_entries WHERE source = 'repayment' AND source_id = $1 AND cooperative_id = $2`,
+      [id, coopId],
+    );
+    if (journalEntry.rows.length > 0) {
+      const entryId = journalEntry.rows[0].id;
+      const lines = await client.query(
+        "SELECT * FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+        [entryId, coopId],
+      );
+      const reversalResult = await client.query(
+        `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id)
+         VALUES (CURRENT_DATE, $1, 'reversal', $2, $3) RETURNING id`,
+        [`Deletion — reversing repayment #${id}`, entryId, coopId],
+      );
+      const reversalId = reversalResult.rows[0].id;
+      for (const line of lines.rows) {
+        await client.query(
+          `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id) VALUES ($1, $2, $3, $4, $5)`,
+          [reversalId, line.account_id, line.credit, line.debit, coopId],
+        );
+      }
+    }
+
+    const loanId = repayment.rows[0].loan_id;
+    await client.query(
+      "DELETE FROM loan_repayments WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+
+    // Recheck loan status after removing this repayment
+    const totals = await client.query(
+      `SELECT l.principal, COALESCE(SUM(r.amount), 0) AS total_repaid
+       FROM loans l LEFT JOIN loan_repayments r ON r.loan_id = l.id
+       WHERE l.id = $1 GROUP BY l.principal`,
+      [loanId],
+    );
+    const isPaid =
+      parseFloat(totals.rows[0].total_repaid) >=
+      parseFloat(totals.rows[0].principal);
+    await client.query(
+      `UPDATE loans SET status = $1 WHERE id = $2 AND cooperative_id = $3`,
+      [isPaid ? "paid" : "active", loanId, coopId],
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "Repayment deleted successfully" });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err.message);

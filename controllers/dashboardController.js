@@ -95,9 +95,11 @@ export const getBalancesByProduct = async (req, res) => {
 export const getPaymentsLedger = async (req, res) => {
   try {
     const coopId = req.user.cooperativeId;
+    const { search, from, to } = req.query;
+
     const result = await pool.query(
       `SELECT 
-         c.id, c.contribution_date AS date, m.full_name, p.name AS product_name, 
+         c.id, c.contribution_date AS date, m.full_name, m.member_number, p.name AS product_name, 
          p.category, c.type, c.amount, 'contribution' AS source
        FROM contributions c
        JOIN members m ON c.member_id = m.id
@@ -107,7 +109,7 @@ export const getPaymentsLedger = async (req, res) => {
        UNION ALL
 
        SELECT 
-         r.id, r.repayment_date AS date, m.full_name, p.name AS product_name,
+         r.id, r.repayment_date AS date, m.full_name, m.member_number, p.name AS product_name,
          'loan_repayment' AS category, 'loan_repayment' AS type, r.amount, 'repayment' AS source
        FROM loan_repayments r
        JOIN loans l ON r.loan_id = l.id
@@ -118,7 +120,24 @@ export const getPaymentsLedger = async (req, res) => {
        ORDER BY date DESC, full_name`,
       [coopId],
     );
-    res.json(result.rows);
+
+    let rows = result.rows;
+    if (search) {
+      const s = search.toLowerCase();
+      rows = rows.filter(
+        (r) =>
+          r.full_name?.toLowerCase().includes(s) ||
+          r.member_number?.toLowerCase().includes(s),
+      );
+    }
+    if (from && to) {
+      rows = rows.filter((r) => {
+        const d = new Date(r.date).toISOString().slice(0, 10);
+        return d >= from && d <= to;
+      });
+    }
+
+    res.json(rows);
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: "Server error" });
@@ -171,4 +190,56 @@ export const getMemberPaymentsLedger = async (req, res) => {
 export const getMyPaymentsLedger = async (req, res) => {
   req.params.memberId = req.user.memberId;
   return getMemberPaymentsLedger(req, res);
+};
+export const getDashboardStats = async (req, res) => {
+  try {
+    const coopId = req.user.cooperativeId;
+    const year = req.query.year || new Date().getFullYear();
+
+    const totalSavings = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN c.type IN ('savings','opening_balance') THEN c.amount 
+                                 WHEN c.type = 'withdrawal' THEN -c.amount ELSE 0 END), 0) AS total
+       FROM contributions c JOIN products p ON c.product_id = p.id
+       WHERE p.category = 'savings' AND c.cooperative_id = $1`,
+      [coopId],
+    );
+
+    const totalLoansGranted = await pool.query(
+      `SELECT COALESCE(SUM(principal), 0) AS total FROM loans WHERE cooperative_id = $1 AND EXTRACT(YEAR FROM date_issued) = $2`,
+      [coopId, year],
+    );
+
+    const totalOutstanding = await pool.query(
+      `SELECT COALESCE(SUM(l.principal - COALESCE(r.total_repaid, 0)), 0) AS total
+       FROM loans l
+       LEFT JOIN (SELECT loan_id, SUM(amount) AS total_repaid FROM loan_repayments WHERE cooperative_id = $1 GROUP BY loan_id) r
+         ON r.loan_id = l.id
+       WHERE l.cooperative_id = $1 AND l.status = 'active'`,
+      [coopId],
+    );
+
+    const monthlySavings = await pool.query(
+      `SELECT EXTRACT(MONTH FROM c.contribution_date) AS month,
+          COALESCE(SUM(CASE WHEN c.type IN ('savings','opening_balance') THEN c.amount WHEN c.type = 'withdrawal' THEN -c.amount ELSE 0 END), 0) AS total
+   FROM contributions c JOIN products p ON c.product_id = p.id
+   WHERE p.category = 'savings' AND c.cooperative_id = $1 AND EXTRACT(YEAR FROM c.contribution_date) = $2::int
+   GROUP BY month ORDER BY month`,
+      [coopId, parseInt(year)],
+    );
+    const memberCount = await pool.query(
+      "SELECT COUNT(*) FROM members WHERE cooperative_id = $1",
+      [coopId],
+    );
+
+    res.json({
+      totalSavings: totalSavings.rows[0].total,
+      totalLoansGranted: totalLoansGranted.rows[0].total,
+      totalOutstanding: totalOutstanding.rows[0].total,
+      memberCount: parseInt(memberCount.rows[0].count),
+      monthlySavings: monthlySavings.rows,
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Server error" });
+  }
 };

@@ -12,6 +12,9 @@ import {
   bulkImportOpeningBalances,
   bulkImportOpeningTrialBalance,
   bulkImportMembers,
+  editContributionAmount,
+  editRepaymentAmount,
+  deleteRepayment,
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
@@ -72,4 +75,22 @@ router.post(
   verifyToken,
   requireAdmin,
   bulkImportMembers,
+);
+router.put(
+  "/contributions/:id/edit-amount",
+  verifyToken,
+  requireAdmin,
+  editContributionAmount,
+);
+router.put(
+  "/repayments/:id/edit-amount",
+  verifyToken,
+  requireAdmin,
+  editRepaymentAmount,
+);
+router.delete(
+  "/repayments/:id/delete",
+  verifyToken,
+  requireAdmin,
+  deleteRepayment,
 );
