@@ -472,7 +472,7 @@ export const bulkImportLoanRepayments = async (req, res) => {
 export const bulkImportLoans = async (req, res) => {
   const client = await pool.connect();
   try {
-    const { rows, productId } = req.body;
+    const { rows, productId, durationValue, durationUnit } = req.body;
     const coopId = req.user.cooperativeId;
 
     const members = await client.query(
@@ -485,7 +485,7 @@ export const bulkImportLoans = async (req, res) => {
     });
 
     const product = await client.query(
-      "SELECT id, name, interest_rate, linked_account_id FROM products WHERE id = $1 AND cooperative_id = $2",
+      "SELECT id, name, interest_rate, interest_type, linked_account_id FROM products WHERE id = $1 AND cooperative_id = $2",
       [productId, coopId],
     );
     if (product.rows.length === 0) {
@@ -494,6 +494,7 @@ export const bulkImportLoans = async (req, res) => {
     const {
       name: productName,
       interest_rate,
+      interest_type,
       linked_account_id,
     } = product.rows[0];
 
@@ -518,24 +519,69 @@ export const bulkImportLoans = async (req, res) => {
         continue;
       }
 
+      // Calculate one-off interest at import time too, matching createLoan's logic
+      const interestAmount =
+        interest_type === "one_off"
+          ? (amount * parseFloat(interest_rate || 0)) / 100
+          : 0;
+
       const loanResult = await client.query(
-        `INSERT INTO loans (member_id, principal, interest_rate, date_issued, status, product_id, cooperative_id)
-         VALUES ($1, $2, $3, $4, 'active', $5, $6) RETURNING id`,
-        [memberId, amount, interest_rate, row.date, productId, coopId],
+        `INSERT INTO loans (member_id, principal, interest_rate, interest_amount, date_issued, status, product_id, cooperative_id, duration_value, duration_unit)
+         VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9) RETURNING id`,
+        [
+          memberId,
+          amount,
+          interest_rate,
+          interestAmount,
+          row.date,
+          productId,
+          coopId,
+          durationValue || null,
+          durationUnit || "months",
+        ],
       );
+      const loanId = loanResult.rows[0].id;
 
       if (linked_account_id) {
         await postJournal(client, {
           entry_date: row.date,
           description: `${productName} issued — ${row.member_name} (imported)`,
           source: "loan",
-          source_id: loanResult.rows[0].id,
+          source_id: loanId,
           cooperativeId: coopId,
           lines: [
             { account_id: linked_account_id, debit: amount, credit: 0 },
             { account_id: cashAccountId, debit: 0, credit: amount },
           ],
         });
+
+        if (interestAmount > 0) {
+          const interestIncomeAccount = await client.query(
+            `SELECT id FROM chart_of_accounts WHERE code = '4000' AND cooperative_id = $1`,
+            [coopId],
+          );
+          if (interestIncomeAccount.rows.length > 0) {
+            await postJournal(client, {
+              entry_date: row.date,
+              description: `Loan interest (one-off, imported) — ${row.member_name}`,
+              source: "loan_interest",
+              source_id: loanId,
+              cooperativeId: coopId,
+              lines: [
+                {
+                  account_id: linked_account_id,
+                  debit: interestAmount,
+                  credit: 0,
+                },
+                {
+                  account_id: interestIncomeAccount.rows[0].id,
+                  debit: 0,
+                  credit: interestAmount,
+                },
+              ],
+            });
+          }
+        }
       }
 
       inserted++;
@@ -1022,6 +1068,138 @@ export const deleteRepayment = async (req, res) => {
 
     await client.query("COMMIT");
     res.json({ message: "Repayment deleted successfully" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+export const deleteMemberDayRecords = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { member_id, date } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    if (!member_id || !date) {
+      return res.status(400).json({ error: "Member and date are required" });
+    }
+
+    await client.query("BEGIN");
+
+    let deletedCount = 0;
+
+    // 1. Reverse and delete all contributions (savings/other/withdrawal) for this member+date
+    const contributions = await client.query(
+      `SELECT id FROM contributions WHERE member_id = $1 AND contribution_date = $2 AND cooperative_id = $3`,
+      [member_id, date, coopId],
+    );
+    for (const c of contributions.rows) {
+      const journalEntry = await client.query(
+        `SELECT id FROM journal_entries WHERE source IN ('contribution','withdrawal') AND source_id = $1 AND cooperative_id = $2`,
+        [c.id, coopId],
+      );
+      if (journalEntry.rows.length > 0) {
+        const entryId = journalEntry.rows[0].id;
+        const lines = await client.query(
+          "SELECT * FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+          [entryId, coopId],
+        );
+        const reversal = await client.query(
+          `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id)
+           VALUES (CURRENT_DATE, $1, 'reversal', $2, $3) RETURNING id`,
+          [`Bulk deletion — member ${member_id} on ${date}`, entryId, coopId],
+        );
+        for (const line of lines.rows) {
+          await client.query(
+            `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id) VALUES ($1, $2, $3, $4, $5)`,
+            [
+              reversal.rows[0].id,
+              line.account_id,
+              line.credit,
+              line.debit,
+              coopId,
+            ],
+          );
+        }
+      }
+      await client.query(
+        "DELETE FROM contributions WHERE id = $1 AND cooperative_id = $2",
+        [c.id, coopId],
+      );
+      deletedCount++;
+    }
+
+    // 2. Reverse and delete all loan repayments for this member+date
+    const repayments = await client.query(
+      `SELECT r.id, r.loan_id FROM loan_repayments r
+       JOIN loans l ON r.loan_id = l.id
+       WHERE l.member_id = $1 AND r.repayment_date = $2 AND r.cooperative_id = $3`,
+      [member_id, date, coopId],
+    );
+    const affectedLoanIds = new Set();
+    for (const r of repayments.rows) {
+      const journalEntry = await client.query(
+        `SELECT id FROM journal_entries WHERE source = 'repayment' AND source_id = $1 AND cooperative_id = $2`,
+        [r.id, coopId],
+      );
+      if (journalEntry.rows.length > 0) {
+        const entryId = journalEntry.rows[0].id;
+        const lines = await client.query(
+          "SELECT * FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+          [entryId, coopId],
+        );
+        const reversal = await client.query(
+          `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id)
+           VALUES (CURRENT_DATE, $1, 'reversal', $2, $3) RETURNING id`,
+          [`Bulk deletion — member ${member_id} on ${date}`, entryId, coopId],
+        );
+        for (const line of lines.rows) {
+          await client.query(
+            `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id) VALUES ($1, $2, $3, $4, $5)`,
+            [
+              reversal.rows[0].id,
+              line.account_id,
+              line.credit,
+              line.debit,
+              coopId,
+            ],
+          );
+        }
+      }
+      await client.query(
+        "DELETE FROM loan_repayments WHERE id = $1 AND cooperative_id = $2",
+        [r.id, coopId],
+      );
+      affectedLoanIds.add(r.loan_id);
+      deletedCount++;
+    }
+
+    // Recheck status for any loans whose repayments were just removed
+    for (const loanId of affectedLoanIds) {
+      const loanRow = await client.query(
+        `SELECT principal, interest_amount FROM loans WHERE id = $1 AND cooperative_id = $2`,
+        [loanId, coopId],
+      );
+      const repayTotals = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total_repaid FROM loan_repayments WHERE loan_id = $1`,
+        [loanId],
+      );
+      const totalOwed =
+        parseFloat(loanRow.rows[0].principal) +
+        parseFloat(loanRow.rows[0].interest_amount || 0);
+      const totalRepaid = parseFloat(repayTotals.rows[0].total_repaid);
+      await client.query(
+        `UPDATE loans SET status = $1 WHERE id = $2 AND cooperative_id = $3`,
+        [totalRepaid >= totalOwed ? "paid" : "active", loanId, coopId],
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Deleted ${deletedCount} record(s) for this member on ${date}`,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err.message);

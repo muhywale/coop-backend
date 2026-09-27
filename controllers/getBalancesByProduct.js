@@ -15,7 +15,7 @@ export const getBalancesByProduct = async (req, res) => {
 
     const loansResult = await pool.query(
       `SELECT m.id AS member_id, m.full_name, p.id AS product_id,m.member_number p.name AS product_name, p.category,
-              COALESCE(SUM(l.principal - COALESCE(r.total_repaid, 0)), 0) AS balance
+              COALESCE(SUM((l.principal - l.interest_amount) - COALESCE(r.total_repaid, 0)), 0) AS balance
        FROM members m
        CROSS JOIN products p
        LEFT JOIN loans l ON l.member_id = m.id AND l.product_id = p.id

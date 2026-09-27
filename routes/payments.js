@@ -15,6 +15,7 @@ import {
   editContributionAmount,
   editRepaymentAmount,
   deleteRepayment,
+  deleteMemberDayRecords,
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
@@ -93,4 +94,10 @@ router.delete(
   verifyToken,
   requireAdmin,
   deleteRepayment,
+);
+router.delete(
+  "/member-day-records",
+  verifyToken,
+  requireAdmin,
+  deleteMemberDayRecords,
 );

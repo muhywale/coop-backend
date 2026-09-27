@@ -7,6 +7,9 @@ import {
   recordRepayment,
   getRepayments,
   getLoansByMemberId,
+  runInterestAccrual,
+  getLoanPerformanceReport,
+  editLoan,
 } from "../controllers/loansController.js";
 
 const router = express.Router();
@@ -17,5 +20,18 @@ router.post("/", verifyToken, requireAdmin, createLoan);
 router.post("/:loanId/repayments", verifyToken, recordRepayment);
 router.get("/:loanId/repayments", verifyToken, getRepayments);
 router.get("/member/:memberId", verifyToken, requireAdmin, getLoansByMemberId);
+router.post(
+  "/run-interest-accrual",
+  verifyToken,
+  requireAdmin,
+  runInterestAccrual,
+);
+router.get(
+  "/performance-report",
+  verifyToken,
+  requireAdmin,
+  getLoanPerformanceReport,
+);
+router.put("/:id/edit", verifyToken, requireAdmin, editLoan);
 
 export default router;

@@ -121,9 +121,9 @@ export const getMemberDetail = async (req, res) => {
     );
 
     const loansResult = await pool.query(
-      `SELECT l.*, l.principal - COALESCE(SUM(r.amount), 0) AS outstanding_balance
-       FROM loans l
-       LEFT JOIN loan_repayments r ON r.loan_id = l.id
+      `SELECT l.*, (l.principal + l.interest_amount) - COALESCE(SUM(r.amount), 0) AS outstanding_balance
+FROM loans l
+LEFT JOIN loan_repayments r ON r.loan_id = l.id
        WHERE l.member_id = $1 AND l.cooperative_id = $2
        GROUP BY l.id
        ORDER BY l.date_issued DESC`,
@@ -207,7 +207,7 @@ export const getMemberLedgerByProduct = async (req, res) => {
 
     const loans = await pool.query(
       `SELECT l.id, p.name AS product_name, l.principal, l.interest_rate, l.date_issued, l.status,
-              l.principal - COALESCE(SUM(r.amount), 0) AS outstanding_balance
+              ( l.principal + l.interest_amount) - COALESCE(SUM(r.amount), 0) AS outstanding_balance
        FROM loans l
        JOIN products p ON l.product_id = p.id
        LEFT JOIN loan_repayments r ON r.loan_id = l.id
@@ -284,7 +284,7 @@ export const getMemberAccountsLedger = async (req, res) => {
     const loanDrResult = await pool.query(
       `SELECT p.id AS product_id, p.name AS product_name,
               date_trunc($3, l.date_issued) AS period,
-              COALESCE(SUM(l.principal), 0) AS dr, 0 AS cr
+              COALESCE(SUM(l.principal + l.interest_amount), 0) AS dr, 0 AS cr
        FROM loans l
        JOIN products p ON l.product_id = p.id
        WHERE l.member_id = $1 AND l.cooperative_id = $2 AND p.category = 'loan'

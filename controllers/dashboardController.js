@@ -34,7 +34,7 @@ export const getLoansSummary = async (req, res) => {
          m.full_name,
          COUNT(l.id) AS total_loans,
          COALESCE(SUM(l.principal), 0) AS total_borrowed,
-         COALESCE(SUM(l.principal - COALESCE(r.total_repaid, 0)), 0) AS total_outstanding
+         COALESCE(SUM((l.principal + l.interest_amount) - COALESCE(r.total_repaid, 0)), 0) AS total_outstanding
        FROM members m
        LEFT JOIN loans l ON l.member_id = m.id AND l.cooperative_id = m.cooperative_id
        LEFT JOIN (
@@ -73,7 +73,7 @@ export const getBalancesByProduct = async (req, res) => {
 
     const loansResult = await pool.query(
       `SELECT m.id AS member_id, m.full_name, p.id AS product_id, p.name AS product_name, p.category,
-              COALESCE(SUM(l.principal - COALESCE(r.total_repaid, 0)), 0) AS balance
+              COALESCE(SUM((l.principal + l.interest_amount) - COALESCE(r.total_repaid, 0)), 0) AS balance
        FROM members m
        CROSS JOIN products p
        LEFT JOIN loans l ON l.member_id = m.id AND l.product_id = p.id AND l.cooperative_id = $1
@@ -99,7 +99,7 @@ export const getPaymentsLedger = async (req, res) => {
 
     const result = await pool.query(
       `SELECT 
-         c.id, c.contribution_date AS date, m.full_name, m.member_number, p.name AS product_name, 
+         c.id, c.contribution_date AS date, c.member_id, m.full_name, m.member_number, p.name AS product_name, 
          p.category, c.type, c.amount, 'contribution' AS source
        FROM contributions c
        JOIN members m ON c.member_id = m.id
@@ -109,7 +109,7 @@ export const getPaymentsLedger = async (req, res) => {
        UNION ALL
 
        SELECT 
-         r.id, r.repayment_date AS date, m.full_name, m.member_number, p.name AS product_name,
+         r.id, r.repayment_date AS date, l.member_id, m.full_name, m.member_number, p.name AS product_name,
          'loan_repayment' AS category, 'loan_repayment' AS type, r.amount, 'repayment' AS source
        FROM loan_repayments r
        JOIN loans l ON r.loan_id = l.id
@@ -210,7 +210,7 @@ export const getDashboardStats = async (req, res) => {
     );
 
     const totalOutstanding = await pool.query(
-      `SELECT COALESCE(SUM(l.principal - COALESCE(r.total_repaid, 0)), 0) AS total
+      `SELECT COALESCE(SUM((l.principal + l.interest_amount) - COALESCE(r.total_repaid, 0)), 0) AS total
        FROM loans l
        LEFT JOIN (SELECT loan_id, SUM(amount) AS total_repaid FROM loan_repayments WHERE cooperative_id = $1 GROUP BY loan_id) r
          ON r.loan_id = l.id
