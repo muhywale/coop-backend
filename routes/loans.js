@@ -10,6 +10,7 @@ import {
   runInterestAccrual,
   getLoanPerformanceReport,
   editLoan,
+  deleteLoan,
 } from "../controllers/loansController.js";
 
 const router = express.Router();
@@ -33,5 +34,6 @@ router.get(
   getLoanPerformanceReport,
 );
 router.put("/:id/edit", verifyToken, requireAdmin, editLoan);
+router.delete("/:id", verifyToken, requireAdmin, deleteLoan);
 
 export default router;

@@ -5,14 +5,14 @@ import { postJournal, getDefaultCashAccount } from "../utils/journal.js";
 export const getLoans = async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT l.*, m.full_name, p.name AS product_name,
+      `SELECT l.*, m.full_name, m.member_number, p.name AS product_name,
               (l.principal + l.interest_amount) - COALESCE(SUM(r.amount), 0) AS outstanding_balance
        FROM loans l
        JOIN members m ON l.member_id = m.id
        LEFT JOIN products p ON l.product_id = p.id
        LEFT JOIN loan_repayments r ON r.loan_id = l.id
        WHERE l.cooperative_id = $1
-       GROUP BY l.id, m.full_name, p.name
+       GROUP BY l.id, m.full_name, m.member_number, p.name
        ORDER BY l.date_issued DESC`,
       [req.user.cooperativeId],
     );
@@ -55,10 +55,34 @@ export const getLoansByMember = async (req, res) => {
 export const createLoan = async (req, res) => {
   const client = await pool.connect();
   try {
-    const { member_id, principal, product_id, duration_value, duration_unit } =
-      req.body;
+    const {
+      member_id,
+      principal,
+      product_id,
+      duration_value,
+      duration_unit,
+      date_issued,
+    } = req.body;
     const coopId = req.user.cooperativeId;
+
+    if (!principal || parseFloat(principal) <= 0) {
+      return res.status(400).json({ error: "Enter a valid principal amount" });
+    }
+
+    // Use the date sent by the form; fall back to today only if missing
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const issueDate = /^\d{4}-\d{2}-\d{2}$/.test(date_issued || "")
+      ? date_issued
+      : today;
+
     await client.query("BEGIN");
+
+    const member = await client.query(
+      "SELECT id FROM members WHERE id = $1 AND cooperative_id = $2",
+      [member_id, coopId],
+    );
+    if (member.rows.length === 0) throw new Error("Member not found");
 
     const product = await client.query(
       "SELECT * FROM products WHERE id = $1 AND cooperative_id = $2",
@@ -67,13 +91,10 @@ export const createLoan = async (req, res) => {
     if (product.rows.length === 0) throw new Error("Product not found");
     const { interest_rate, interest_type, linked_account_id } = product.rows[0];
 
-    // One-off interest is calculated once, upfront, on the full principal
     const interestAmount =
       interest_type === "one_off"
         ? (parseFloat(principal) * parseFloat(interest_rate || 0)) / 100
-        : 0; // reducing_balance accrues separately via runInterestAccrual
-
-    const todayStr = new Date().toISOString().slice(0, 10);
+        : 0;
 
     const result = await client.query(
       `INSERT INTO loans (member_id, principal, interest_rate, interest_amount, date_issued, status, product_id, cooperative_id, duration_value, duration_unit)
@@ -83,7 +104,7 @@ export const createLoan = async (req, res) => {
         principal,
         interest_rate,
         interestAmount,
-        todayStr,
+        issueDate,
         product_id,
         coopId,
         duration_value || null,
@@ -95,7 +116,7 @@ export const createLoan = async (req, res) => {
     const cashAccountId = await getDefaultCashAccount(client, coopId);
     if (linked_account_id) {
       await postJournal(client, {
-        entry_date: todayStr,
+        entry_date: issueDate,
         description: `Loan issued — member ${member_id}`,
         source: "loan",
         source_id: newLoanId,
@@ -113,7 +134,7 @@ export const createLoan = async (req, res) => {
         );
         if (interestIncomeAccount.rows.length > 0) {
           await postJournal(client, {
-            entry_date: todayStr,
+            entry_date: issueDate,
             description: `Loan interest (one-off) — loan #${newLoanId}`,
             source: "loan_interest",
             source_id: newLoanId,
@@ -185,6 +206,123 @@ export const recordRepayment = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(err.message);
     res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
+  }
+};
+
+// Posts the mirror-image of an existing journal entry, dated the same as the original
+const reverseJournalEntry = async (client, entryId, coopId, description) => {
+  const original = await client.query(
+    "SELECT entry_date FROM journal_entries WHERE id = $1 AND cooperative_id = $2",
+    [entryId, coopId],
+  );
+  const lines = await client.query(
+    "SELECT account_id, debit, credit FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
+    [entryId, coopId],
+  );
+  const reversal = await client.query(
+    `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id)
+     VALUES ($1, $2, 'reversal', $3, $4) RETURNING id`,
+    [original.rows[0].entry_date, description, entryId, coopId],
+  );
+  for (const line of lines.rows) {
+    await client.query(
+      `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [reversal.rows[0].id, line.account_id, line.credit, line.debit, coopId],
+    );
+  }
+};
+
+export const deleteLoan = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const coopId = req.user.cooperativeId;
+    await client.query("BEGIN");
+
+    const loan = await client.query(
+      "SELECT id FROM loans WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    if (loan.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Loan not found" });
+    }
+
+    const description = `Deleted loan #${id}`;
+
+    // 1. Issuance + interest entries (always keyed by the loan's own id)
+    const loanEntries = await client.query(
+      `SELECT je.id FROM journal_entries je
+       WHERE je.source IN ('loan', 'loan_interest') AND je.source_id = $1 AND je.cooperative_id = $2
+         AND NOT EXISTS (
+           SELECT 1 FROM journal_entries rev
+           WHERE rev.source = 'reversal' AND rev.source_id = je.id AND rev.cooperative_id = $2
+         )`,
+      [id, coopId],
+    );
+    for (const entry of loanEntries.rows) {
+      await reverseJournalEntry(client, entry.id, coopId, description);
+    }
+
+    // 2. Repayment entries — older ones are keyed by loan id, newer ones by repayment id,
+    //    so match on key + date + amount to avoid touching anyone else's entries
+    const repayments = await client.query(
+      "SELECT id FROM loan_repayments WHERE loan_id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    const usedEntryIds = [];
+    let unmatched = 0;
+    for (const r of repayments.rows) {
+      const match = await client.query(
+        `SELECT je.id
+         FROM journal_entries je
+         JOIN journal_lines jl ON jl.journal_entry_id = je.id
+         JOIN loan_repayments r ON r.id = $1
+         WHERE je.source = 'repayment' AND je.source_id IN (r.id, r.loan_id)
+           AND je.cooperative_id = $2 AND je.entry_date = r.repayment_date
+           AND NOT (je.id = ANY($3::int[]))
+           AND NOT EXISTS (
+             SELECT 1 FROM journal_entries rev
+             WHERE rev.source = 'reversal' AND rev.source_id = je.id AND rev.cooperative_id = $2
+           )
+         GROUP BY je.id, r.amount
+         HAVING SUM(jl.debit) = r.amount
+         LIMIT 1`,
+        [r.id, coopId, usedEntryIds],
+      );
+      if (match.rows.length > 0) {
+        await reverseJournalEntry(
+          client,
+          match.rows[0].id,
+          coopId,
+          description,
+        );
+        usedEntryIds.push(match.rows[0].id);
+      } else {
+        unmatched++;
+      }
+    }
+
+    await client.query(
+      "DELETE FROM loan_repayments WHERE loan_id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+    await client.query(
+      "DELETE FROM loans WHERE id = $1 AND cooperative_id = $2",
+      [id, coopId],
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Loan deleted${unmatched > 0 ? ` (${unmatched} repayment(s) had no matching ledger entry to reverse)` : ""}`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
