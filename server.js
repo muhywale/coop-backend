@@ -14,6 +14,7 @@ import paymentsRoutes from "./routes/payments.js";
 import journalRoutes from "./routes/journal.js";
 import superAdminRoutes from "./routes/superAdmin.js";
 import chartOfAccountsRoutes from "./routes/chartOfAccounts.js";
+import scheduleRoutes from "./routes/schedule.js";
 
 dotenv.config();
 
@@ -62,6 +63,7 @@ app.use("/api/payments", paymentsRoutes);
 app.use("/api/journal", journalRoutes);
 app.use("/api/super-admin", superAdminRoutes);
 app.use("/api/chart-of-accounts", chartOfAccountsRoutes);
+app.use("/api/schedule", scheduleRoutes);
 
 //console.log("JWT_SECRET is", process.env.JWT_SECRET);
 

@@ -12,17 +12,28 @@ export const getProducts = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 };
+
 export const createProduct = async (req, res) => {
   try {
-    const { name, category, description, linked_account_id } = req.body;
+    const {
+      name,
+      category,
+      description,
+      linked_account_id,
+      is_compulsory,
+      due_frequency,
+    } = req.body;
     const interest_type = req.body.interest_type || null;
     const interest_rate = req.body.interest_rate
       ? parseFloat(req.body.interest_rate)
       : null;
+    const expected_amount = req.body.expected_amount
+      ? parseFloat(req.body.expected_amount)
+      : null;
 
     const result = await pool.query(
-      `INSERT INTO products (name, category, interest_type, interest_rate, description, linked_account_id, cooperative_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      `INSERT INTO products (name, category, interest_type, interest_rate, description, linked_account_id, is_compulsory, expected_amount, due_frequency, cooperative_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
       [
         name,
         category,
@@ -30,6 +41,9 @@ export const createProduct = async (req, res) => {
         interest_rate,
         description,
         linked_account_id || null,
+        !!is_compulsory,
+        expected_amount,
+        due_frequency || "monthly",
         req.user.cooperativeId,
       ],
     );
@@ -50,10 +64,14 @@ export const updateProduct = async (req, res) => {
       interest_rate,
       description,
       linked_account_id,
+      is_compulsory,
+      expected_amount,
+      due_frequency,
     } = req.body;
     const result = await pool.query(
-      `UPDATE products SET name=$1, category=$2, interest_type=$3, interest_rate=$4, description=$5, linked_account_id=$6
-       WHERE id=$7 AND cooperative_id=$8 RETURNING *`,
+      `UPDATE products SET name=$1, category=$2, interest_type=$3, interest_rate=$4, description=$5,
+       linked_account_id=$6, is_compulsory=$7, expected_amount=$8, due_frequency=$9
+       WHERE id=$10 AND cooperative_id=$11 RETURNING *`,
       [
         name,
         category,
@@ -61,6 +79,9 @@ export const updateProduct = async (req, res) => {
         interest_rate,
         description,
         linked_account_id || null,
+        !!is_compulsory,
+        expected_amount ? parseFloat(expected_amount) : null,
+        due_frequency || "monthly",
         id,
         req.user.cooperativeId,
       ],
