@@ -1208,3 +1208,248 @@ export const deleteMemberDayRecords = async (req, res) => {
     client.release();
   }
 };
+// Bulk import Chart of Accounts — creates accounts that don't already exist by code
+export const bulkImportChartOfAccounts = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows, codeColumn, nameColumn, typeColumn, normalBalanceColumn } =
+      req.body;
+    const coopId = req.user.cooperativeId;
+
+    const existing = await client.query(
+      "SELECT code FROM chart_of_accounts WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const existingCodes = new Set(existing.rows.map((r) => r.code));
+
+    const validTypes = ["asset", "liability", "equity", "income", "expense"];
+    let inserted = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const code = String(row[codeColumn] ?? "").trim();
+      const name = String(row[nameColumn] ?? "").trim();
+      let accountType = String(row[typeColumn] ?? "")
+        .trim()
+        .toLowerCase();
+      let normalBalance = String(row[normalBalanceColumn] ?? "")
+        .trim()
+        .toLowerCase();
+
+      if (!code || !name) {
+        skipped.push({ code, name, reason: "Missing code or name" });
+        continue;
+      }
+      if (existingCodes.has(code)) {
+        skipped.push({ code, name, reason: "Code already exists" });
+        continue;
+      }
+      if (!validTypes.includes(accountType)) {
+        skipped.push({
+          code,
+          name,
+          reason: `Invalid account type "${accountType}" (must be asset/liability/equity/income/expense)`,
+        });
+        continue;
+      }
+      if (normalBalance !== "debit" && normalBalance !== "credit") {
+        // Sensible default if left blank or mistyped — matches the same rule used in the UI form
+        normalBalance = ["asset", "expense"].includes(accountType)
+          ? "debit"
+          : "credit";
+      }
+
+      try {
+        await client.query(
+          `INSERT INTO chart_of_accounts (code, name, account_type, normal_balance, cooperative_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [code, name, accountType, normalBalance, coopId],
+        );
+        existingCodes.add(code);
+        inserted++;
+      } catch (err) {
+        skipped.push({ code, name, reason: err.message });
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ message: `Created ${inserted} account(s)`, skipped });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};
+
+// Bulk import Products — looks up the linked account by code, creates or updates by name
+export const bulkImportProducts = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const {
+      rows,
+      nameColumn,
+      categoryColumn,
+      interestRateColumn,
+      interestTypeColumn,
+      linkedAccountCodeColumn,
+      isCompulsoryColumn,
+      expectedAmountColumn,
+      dueFrequencyColumn,
+    } = req.body;
+    const coopId = req.user.cooperativeId;
+
+    const accounts = await client.query(
+      "SELECT id, code FROM chart_of_accounts WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const accountByCode = {};
+    accounts.rows.forEach((a) => {
+      accountByCode[a.code] = a.id;
+    });
+
+    const existingProducts = await client.query(
+      "SELECT id, name FROM products WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const productByName = {};
+    existingProducts.rows.forEach((p) => {
+      productByName[p.name.trim().toLowerCase()] = p.id;
+    });
+
+    let created = 0;
+    let updated = 0;
+    const skipped = [];
+
+    await client.query("BEGIN");
+
+    for (const row of rows) {
+      const name = String(row[nameColumn] ?? "").trim();
+      if (!name) {
+        skipped.push({
+          row: JSON.stringify(row),
+          reason: "Missing product name",
+        });
+        continue;
+      }
+
+      let category = String(row[categoryColumn] ?? "")
+        .trim()
+        .toLowerCase();
+      if (!["savings", "loan", "other"].includes(category)) {
+        skipped.push({
+          name,
+          reason: `Invalid category "${category}" (must be savings/loan/other)`,
+        });
+        continue;
+      }
+
+      const interestRate =
+        interestRateColumn && row[interestRateColumn] !== ""
+          ? parseFloat(row[interestRateColumn])
+          : null;
+      let interestType = interestTypeColumn
+        ? String(row[interestTypeColumn] ?? "")
+            .trim()
+            .toLowerCase()
+        : null;
+      if (
+        interestType &&
+        !["one_off", "reducing_balance"].includes(interestType)
+      )
+        interestType = null;
+
+      let linkedAccountId = null;
+      if (linkedAccountCodeColumn) {
+        const code = String(row[linkedAccountCodeColumn] ?? "").trim();
+        if (code) {
+          linkedAccountId = accountByCode[code] || null;
+          if (!linkedAccountId) {
+            skipped.push({
+              name,
+              reason: `Linked account code "${code}" not found in Chart of Accounts`,
+            });
+          }
+        }
+      }
+
+      const isCompulsory = isCompulsoryColumn
+        ? ["yes", "true", "1", "y"].includes(
+            String(row[isCompulsoryColumn] ?? "")
+              .trim()
+              .toLowerCase(),
+          )
+        : false;
+      const expectedAmount =
+        expectedAmountColumn && row[expectedAmountColumn] !== ""
+          ? parseFloat(row[expectedAmountColumn])
+          : null;
+      let dueFrequency = dueFrequencyColumn
+        ? String(row[dueFrequencyColumn] ?? "")
+            .trim()
+            .toLowerCase()
+        : "monthly";
+      if (!["weekly", "monthly"].includes(dueFrequency))
+        dueFrequency = "monthly";
+
+      const existingId = productByName[name.toLowerCase()];
+
+      try {
+        if (existingId) {
+          await client.query(
+            `UPDATE products SET category=$1, interest_type=$2, interest_rate=$3, linked_account_id=$4,
+             is_compulsory=$5, expected_amount=$6, due_frequency=$7
+             WHERE id=$8 AND cooperative_id=$9`,
+            [
+              category,
+              interestType,
+              interestRate,
+              linkedAccountId,
+              isCompulsory,
+              expectedAmount,
+              dueFrequency,
+              existingId,
+              coopId,
+            ],
+          );
+          updated++;
+        } else {
+          const result = await client.query(
+            `INSERT INTO products (name, category, interest_type, interest_rate, linked_account_id, is_compulsory, expected_amount, due_frequency, cooperative_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+            [
+              name,
+              category,
+              interestType,
+              interestRate,
+              linkedAccountId,
+              isCompulsory,
+              expectedAmount,
+              dueFrequency,
+              coopId,
+            ],
+          );
+          productByName[name.toLowerCase()] = result.rows[0].id;
+          created++;
+        }
+      } catch (err) {
+        skipped.push({ name, reason: err.message });
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      message: `Created ${created}, updated ${updated} product(s)`,
+      skipped,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+};

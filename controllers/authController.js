@@ -67,9 +67,12 @@ export const changePassword = async (req, res) => {
 export const login = async (req, res) => {
   try {
     const { username, password } = req.body;
-    const result = await pool.query("SELECT * FROM users WHERE username = $1", [
-      username,
-    ]);
+    const result = await pool.query(
+      `SELECT u.*, c.name AS cooperative_name, c.logo_url, c.primary_color
+       FROM users u JOIN cooperatives c ON u.cooperative_id = c.id
+       WHERE u.username = $1`,
+      [username],
+    );
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -87,16 +90,15 @@ export const login = async (req, res) => {
         role: user.role,
         cooperativeId: user.cooperative_id,
       },
-      // eslint-disable-next-line no-undef
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
 
     res.cookie("token", token, {
       httpOnly: true,
-      secure: true, // HTTPS only in production
+      secure: true,
       sameSite: "none",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     res.json({
@@ -106,6 +108,9 @@ export const login = async (req, res) => {
         role: user.role,
         member_id: user.member_id,
         cooperative_id: user.cooperative_id,
+        cooperative_name: user.cooperative_name,
+        logo_url: user.logo_url,
+        primary_color: user.primary_color,
         must_change_password: user.must_change_password,
       },
     });

@@ -16,6 +16,8 @@ import {
   editRepaymentAmount,
   deleteRepayment,
   deleteMemberDayRecords,
+  bulkImportChartOfAccounts,
+  bulkImportProducts,
 } from "../controllers/paymentsController.js";
 
 const router = express.Router();
@@ -100,4 +102,16 @@ router.delete(
   verifyToken,
   requireAdmin,
   deleteMemberDayRecords,
+);
+router.post(
+  "/bulk-import-chart-of-accounts",
+  verifyToken,
+  requireAdmin,
+  bulkImportChartOfAccounts,
+);
+router.post(
+  "/bulk-import-products",
+  verifyToken,
+  requireAdmin,
+  bulkImportProducts,
 );
