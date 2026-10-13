@@ -16,6 +16,7 @@ import superAdminRoutes from "./routes/superAdmin.js";
 import chartOfAccountsRoutes from "./routes/chartOfAccounts.js";
 import scheduleRoutes from "./routes/schedule.js";
 import cooperativeRoutes from "./routes/cooperative.js";
+import bankImportRoutes from "./routes/bankImport.js";
 
 dotenv.config();
 
@@ -66,6 +67,7 @@ app.use("/api/super-admin", superAdminRoutes);
 app.use("/api/chart-of-accounts", chartOfAccountsRoutes);
 app.use("/api/schedule", scheduleRoutes);
 app.use("/api/cooperative", cooperativeRoutes);
+app.use("/api/bank-import", bankImportRoutes);
 
 //console.log("JWT_SECRET is", process.env.JWT_SECRET);
 
