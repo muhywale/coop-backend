@@ -656,8 +656,8 @@ export const bulkImportOpeningBalances = async (req, res) => {
           }
 
           await client.query(
-            `INSERT INTO loans (member_id, principal, interest_rate, date_issued, status, product_id, cooperative_id)
-             VALUES ($1, $2, $3, $4, 'active', $5, $6)`,
+            `INSERT INTO loans (member_id, principal, interest_rate, date_issued, status, product_id, cooperative_id, is_opening)
+   VALUES ($1, $2, $3, $4, 'active', $5, $6, true)`,
             [
               memberId,
               amount,
