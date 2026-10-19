@@ -212,27 +212,28 @@ export const recordRepayment = async (req, res) => {
 };
 
 // Posts the mirror-image of an existing journal entry, dated the same as the original
-const reverseJournalEntry = async (client, entryId, coopId, description) => {
-  const original = await client.query(
-    "SELECT entry_date FROM journal_entries WHERE id = $1 AND cooperative_id = $2",
-    [entryId, coopId],
+// Removes journal entries outright, plus any reversal entries that point at them
+const purgeJournalEntries = async (client, entryIds, coopId) => {
+  if (entryIds.length === 0) return 0;
+
+  const reversals = await client.query(
+    `SELECT id FROM journal_entries
+     WHERE source = 'reversal' AND source_id = ANY($1::int[]) AND cooperative_id = $2`,
+    [entryIds, coopId],
   );
-  const lines = await client.query(
-    "SELECT account_id, debit, credit FROM journal_lines WHERE journal_entry_id = $1 AND cooperative_id = $2",
-    [entryId, coopId],
+  const allIds = [
+    ...new Set([...entryIds, ...reversals.rows.map((r) => r.id)]),
+  ];
+
+  await client.query(
+    "DELETE FROM journal_lines WHERE journal_entry_id = ANY($1::int[]) AND cooperative_id = $2",
+    [allIds, coopId],
   );
-  const reversal = await client.query(
-    `INSERT INTO journal_entries (entry_date, description, source, source_id, cooperative_id)
-     VALUES ($1, $2, 'reversal', $3, $4) RETURNING id`,
-    [original.rows[0].entry_date, description, entryId, coopId],
+  await client.query(
+    "DELETE FROM journal_entries WHERE id = ANY($1::int[]) AND cooperative_id = $2",
+    [allIds, coopId],
   );
-  for (const line of lines.rows) {
-    await client.query(
-      `INSERT INTO journal_lines (journal_entry_id, account_id, debit, credit, cooperative_id)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [reversal.rows[0].id, line.account_id, line.credit, line.debit, coopId],
-    );
-  }
+  return allIds.length;
 };
 
 export const deleteLoan = async (req, res) => {
@@ -251,29 +252,20 @@ export const deleteLoan = async (req, res) => {
       return res.status(404).json({ error: "Loan not found" });
     }
 
-    const description = `Deleted loan #${id}`;
-
-    // 1. Issuance + interest entries (always keyed by the loan's own id)
+    // 1. Issuance, one-off interest and any monthly accruals (all keyed by the loan's own id)
     const loanEntries = await client.query(
-      `SELECT je.id FROM journal_entries je
-       WHERE je.source IN ('loan', 'loan_interest') AND je.source_id = $1 AND je.cooperative_id = $2
-         AND NOT EXISTS (
-           SELECT 1 FROM journal_entries rev
-           WHERE rev.source = 'reversal' AND rev.source_id = je.id AND rev.cooperative_id = $2
-         )`,
+      `SELECT id FROM journal_entries
+       WHERE source IN ('loan', 'loan_interest') AND source_id = $1 AND cooperative_id = $2`,
       [id, coopId],
     );
-    for (const entry of loanEntries.rows) {
-      await reverseJournalEntry(client, entry.id, coopId, description);
-    }
+    const entryIds = loanEntries.rows.map((r) => r.id);
 
-    // 2. Repayment entries — older ones are keyed by loan id, newer ones by repayment id,
-    //    so match on key + date + amount to avoid touching anyone else's entries
+    // 2. Repayment entries. Older ones are keyed by loan id, newer ones by repayment id,
+    //    so match on key + date + amount to avoid touching another loan's entries.
     const repayments = await client.query(
       "SELECT id FROM loan_repayments WHERE loan_id = $1 AND cooperative_id = $2",
       [id, coopId],
     );
-    const usedEntryIds = [];
     let unmatched = 0;
     for (const r of repayments.rows) {
       const match = await client.query(
@@ -284,27 +276,16 @@ export const deleteLoan = async (req, res) => {
          WHERE je.source = 'repayment' AND je.source_id IN (r.id, r.loan_id)
            AND je.cooperative_id = $2 AND je.entry_date = r.repayment_date
            AND NOT (je.id = ANY($3::int[]))
-           AND NOT EXISTS (
-             SELECT 1 FROM journal_entries rev
-             WHERE rev.source = 'reversal' AND rev.source_id = je.id AND rev.cooperative_id = $2
-           )
          GROUP BY je.id, r.amount
          HAVING SUM(jl.debit) = r.amount
          LIMIT 1`,
-        [r.id, coopId, usedEntryIds],
+        [r.id, coopId, entryIds],
       );
-      if (match.rows.length > 0) {
-        await reverseJournalEntry(
-          client,
-          match.rows[0].id,
-          coopId,
-          description,
-        );
-        usedEntryIds.push(match.rows[0].id);
-      } else {
-        unmatched++;
-      }
+      if (match.rows.length > 0) entryIds.push(match.rows[0].id);
+      else unmatched++;
     }
+
+    const removed = await purgeJournalEntries(client, entryIds, coopId);
 
     await client.query(
       "DELETE FROM loan_repayments WHERE loan_id = $1 AND cooperative_id = $2",
@@ -317,11 +298,11 @@ export const deleteLoan = async (req, res) => {
 
     await client.query("COMMIT");
     res.json({
-      message: `Loan deleted${unmatched > 0 ? ` (${unmatched} repayment(s) had no matching ledger entry to reverse)` : ""}`,
+      message: `Loan deleted completely — ${repayments.rows.length} repayment(s) and ${removed} ledger entr${removed === 1 ? "y" : "ies"} removed${unmatched > 0 ? ` (${unmatched} repayment(s) had no ledger entry to remove)` : ""}`,
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error(err.message);
+    console.error("deleteLoan failed:", err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
