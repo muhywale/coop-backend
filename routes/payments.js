@@ -5,20 +5,22 @@ import { body, validationResult } from "express-validator";
 import {
   distributePayment,
   withdrawFunds,
-  correctContribution,
   bulkImportPayments,
   bulkImportLoanRepayments,
   bulkImportLoans,
   bulkImportOpeningBalances,
   bulkImportOpeningTrialBalance,
   bulkImportMembers,
-  editContributionAmount,
-  editRepaymentAmount,
-  deleteRepayment,
-  deleteMemberDayRecords,
   bulkImportChartOfAccounts,
   bulkImportProducts,
 } from "../controllers/paymentsController.js";
+import {
+  correctContribution,
+  deleteRepayment,
+  deleteMemberDayRecords,
+  editContributionAmount,
+  editRepaymentAmount,
+} from "../controllers/ledgerCorrectionController.js";
 
 const router = express.Router();
 
