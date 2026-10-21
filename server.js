@@ -19,6 +19,8 @@ import cooperativeRoutes from "./routes/cooperative.js";
 import bankImportRoutes from "./routes/bankImport.js";
 import carryForwardRoutes from "./routes/carryForward.js";
 import bulkPaymentRoutes from "./routes/bulkPayments.js";
+import usersRoutes from "./routes/users.js";
+import backupRoutes from "./routes/backup.js";
 
 dotenv.config();
 
@@ -72,6 +74,8 @@ app.use("/api/cooperative", cooperativeRoutes);
 app.use("/api/bank-import", bankImportRoutes);
 app.use("/api/carry-forward", carryForwardRoutes);
 app.use("/api/bulk-payments", bulkPaymentRoutes);
+app.use("/api/users", usersRoutes);
+app.use("/api/backup", backupRoutes);
 //console.log("JWT_SECRET is", process.env.JWT_SECRET);
 
 // eslint-disable-next-line no-undef
