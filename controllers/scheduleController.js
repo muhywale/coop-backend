@@ -25,10 +25,20 @@ function getMonthRange(dateStr) {
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// "2026-11-05" -> a single number counting months, so month arithmetic is simple
+const monthIndex = (dateStr) => {
+  const [y, m] = dateStr.split("-").map(Number);
+  return y * 12 + (m - 1);
+};
+
 export const getPaymentSchedule = async (req, res) => {
   try {
     const coopId = req.user.cooperativeId;
     const periodType = req.query.period_type === "week" ? "week" : "month";
+    // Products store "weekly" / "monthly"; the period selector uses "week" / "month"
+    const frequency = periodType === "week" ? "weekly" : "monthly";
+    const otherFrequency = frequency === "weekly" ? "monthly" : "weekly";
+
     const anchorDate = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "")
       ? req.query.date
       : toLocalDateString(new Date());
@@ -37,20 +47,48 @@ export const getPaymentSchedule = async (req, res) => {
         ? getWeekRange(anchorDate)
         : getMonthRange(anchorDate);
     const periodEnded = periodEnd < toLocalDateString(new Date());
+    const warnings = [];
 
-    const [duesProducts, members] = await Promise.all([
-      pool.query(
-        `SELECT id, name, expected_amount FROM products
-         WHERE cooperative_id = $1 AND active = true AND is_compulsory = true AND due_frequency = $2
+    const [duesProducts, members, otherFreqDues, noAmountDues] =
+      await Promise.all([
+        pool.query(
+          `SELECT id, name, expected_amount FROM products
+         WHERE cooperative_id = $1 AND active = true AND is_compulsory = true
+           AND COALESCE(due_frequency, 'monthly') = $2 AND COALESCE(expected_amount, 0) > 0
          ORDER BY name`,
-        [coopId, periodType],
-      ),
-      pool.query(
-        `SELECT id, full_name, member_number FROM members
+          [coopId, frequency],
+        ),
+        pool.query(
+          `SELECT id, full_name, member_number FROM members
          WHERE cooperative_id = $1 AND status = 'active' ORDER BY full_name`,
-        [coopId],
-      ),
-    ]);
+          [coopId],
+        ),
+        pool.query(
+          `SELECT name FROM products
+         WHERE cooperative_id = $1 AND active = true AND is_compulsory = true
+           AND COALESCE(due_frequency, 'monthly') <> $2 AND COALESCE(expected_amount, 0) > 0
+         ORDER BY name`,
+          [coopId, frequency],
+        ),
+        pool.query(
+          `SELECT name FROM products
+         WHERE cooperative_id = $1 AND active = true AND is_compulsory = true
+           AND COALESCE(expected_amount, 0) <= 0
+         ORDER BY name`,
+          [coopId],
+        ),
+      ]);
+
+    if (otherFreqDues.rows.length > 0) {
+      warnings.push(
+        `Set as ${otherFrequency} dues, so they show in the ${otherFrequency === "weekly" ? "Weekly" : "Monthly"} view instead: ${otherFreqDues.rows.map((r) => r.name).join(", ")}`,
+      );
+    }
+    if (noAmountDues.rows.length > 0) {
+      warnings.push(
+        `Marked compulsory but with no amount set, so they can't be scheduled: ${noAmountDues.rows.map((r) => r.name).join(", ")}. Edit them on the Products page.`,
+      );
+    }
 
     const columns = duesProducts.rows.map((p) => ({
       key: `due_${p.id}`,
@@ -67,13 +105,13 @@ export const getPaymentSchedule = async (req, res) => {
       };
     });
 
-    // Compulsory dues
+    // ---- Compulsory dues ----
     if (duesProducts.rows.length > 0) {
       const paid = await pool.query(
         `SELECT member_id, product_id, COALESCE(SUM(amount), 0) AS paid
          FROM contributions
          WHERE cooperative_id = $1 AND product_id = ANY($2::int[])
-           AND contribution_date BETWEEN $3 AND $4 AND type IN ('savings', 'other')
+           AND contribution_date BETWEEN $3::date AND $4::date AND type IN ('savings', 'other')
          GROUP BY member_id, product_id`,
         [coopId, duesProducts.rows.map((p) => p.id), periodStart, periodEnd],
       );
@@ -84,30 +122,32 @@ export const getPaymentSchedule = async (req, res) => {
 
       for (const m of members.rows) {
         for (const p of duesProducts.rows) {
-          const expected = parseFloat(p.expected_amount || 0);
-          if (expected <= 0) continue;
           rowsByMember[m.id].items[`due_${p.id}`] = {
-            expected,
+            expected: parseFloat(p.expected_amount),
             paid: paidMap[`${m.id}-${p.id}`] || 0,
           };
         }
       }
     }
 
-    // Loan installments: first installment falls in the first period after the loan is issued
+    // ---- Loan installments ----
+    // "First payment is due" is a product setting: 0 = in the booking month, 1 = the month after
     const loans = await pool.query(
       `SELECT l.id, l.member_id, l.product_id, p.name AS product_name,
               l.principal, l.interest_amount, l.duration_value,
               COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
                         WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
-                          AND r.repayment_date < $3), 0) AS repaid_before,
+                          AND r.repayment_date < $3::date), 0) AS repaid_before,
               COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
                         WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
-                          AND r.repayment_date BETWEEN $3 AND $4), 0) AS paid_in_period
+                          AND r.repayment_date BETWEEN $3::date AND $4::date), 0) AS paid_in_period
        FROM loans l
        JOIN products p ON l.product_id = p.id
        WHERE l.cooperative_id = $1 AND l.duration_unit = $2 AND l.duration_value > 0
-         AND l.date_issued < $3
+         AND (
+           (COALESCE(p.first_payment_offset, 1) = 0 AND l.date_issued <= $4::date)
+           OR (COALESCE(p.first_payment_offset, 1) = 1 AND l.date_issued < $3::date)
+         )
        ORDER BY p.name`,
       [
         coopId,
@@ -146,6 +186,123 @@ export const getPaymentSchedule = async (req, res) => {
     }
     columns.push(...loanColumns.values());
 
+    // ---- Interest due, collected through a separate payment line ----
+    const interestColumns = new Map();
+    const productsWithoutLine = new Set();
+
+    const addInterestDue = (loan, due) => {
+      if (due <= 0) return;
+      if (!loan.interest_product_id) {
+        productsWithoutLine.add(loan.product_name);
+        return;
+      }
+      const row = rowsByMember[loan.member_id];
+      if (!row) return;
+      const key = `interest_${loan.interest_product_id}`;
+      if (!interestColumns.has(key)) {
+        interestColumns.set(key, {
+          key,
+          label: `${loan.interest_product_name} (interest due)`,
+          kind: "interest",
+          productId: loan.interest_product_id,
+        });
+      }
+      const item = row.items[key] || { expected: 0, paid: 0 };
+      item.expected += due;
+      row.items[key] = item;
+    };
+
+    // (a) Reducing balance: a yearly rate on the principal still owed, every period
+    const periodsPerYear = periodType === "week" ? 52 : 12;
+    const reducing = await pool.query(
+      `SELECT l.member_id, l.principal,
+              COALESCE(l.interest_rate, p.interest_rate) AS rate,
+              p.name AS product_name, p.interest_product_id, ip.name AS interest_product_name,
+              COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
+                        WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
+                          AND r.repayment_date < $2::date), 0) AS repaid_before
+       FROM loans l
+       JOIN products p ON p.id = l.product_id
+       LEFT JOIN products ip ON ip.id = p.interest_product_id
+       WHERE l.cooperative_id = $1 AND p.interest_type = 'reducing_balance'
+         AND l.date_issued < $2::date`,
+      [coopId, periodStart],
+    );
+    for (const loan of reducing.rows) {
+      const outstanding =
+        parseFloat(loan.principal) - parseFloat(loan.repaid_before);
+      const rate = parseFloat(loan.rate || 0);
+      if (outstanding <= 0.005 || rate <= 0) continue;
+      addInterestDue(loan, (outstanding * rate) / 100 / periodsPerYear);
+    }
+
+    // (b) Scheduled charges: one-off charges that fall in a particular month after the first payment
+    const scheduled = await pool.query(
+      `SELECT l.member_id, l.principal, to_char(l.date_issued, 'YYYY-MM-DD') AS issued_str,
+              p.name AS product_name, p.interest_rules,
+              COALESCE(p.first_payment_offset, 1) AS first_offset,
+              p.interest_product_id, ip.name AS interest_product_name,
+              COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
+                        WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
+                          AND r.repayment_date < $2::date), 0) AS repaid_before
+       FROM loans l
+       JOIN products p ON p.id = l.product_id
+       LEFT JOIN products ip ON ip.id = p.interest_product_id
+       WHERE l.cooperative_id = $1 AND p.interest_type = 'scheduled'
+         AND jsonb_array_length(COALESCE(p.interest_rules, '[]'::jsonb)) > 0
+         AND l.date_issued <= $3::date`,
+      [coopId, periodStart, periodEnd],
+    );
+    if (periodType === "month") {
+      const periodIdx = monthIndex(periodStart);
+      for (const loan of scheduled.rows) {
+        const outstanding =
+          parseFloat(loan.principal) - parseFloat(loan.repaid_before);
+        if (outstanding <= 0.005) continue;
+        const firstPaymentMonth =
+          monthIndex(loan.issued_str) + Number(loan.first_offset);
+        for (const rule of loan.interest_rules) {
+          if (firstPaymentMonth + Number(rule.months_after) !== periodIdx)
+            continue;
+          const base =
+            rule.basis === "balance" ? outstanding : parseFloat(loan.principal);
+          addInterestDue(loan, (base * parseFloat(rule.rate)) / 100);
+        }
+      }
+    } else if (scheduled.rows.length > 0) {
+      warnings.push(
+        "Scheduled interest charges fall in a particular month, so they appear in the Monthly view.",
+      );
+    }
+
+    if (interestColumns.size > 0) {
+      const paidInterest = await pool.query(
+        `SELECT member_id, product_id, COALESCE(SUM(amount), 0) AS paid
+         FROM contributions
+         WHERE cooperative_id = $1 AND product_id = ANY($2::int[])
+           AND contribution_date BETWEEN $3::date AND $4::date AND type IN ('savings', 'other')
+         GROUP BY member_id, product_id`,
+        [
+          coopId,
+          [...interestColumns.values()].map((c) => c.productId),
+          periodStart,
+          periodEnd,
+        ],
+      );
+      paidInterest.rows.forEach((r) => {
+        const item =
+          rowsByMember[r.member_id]?.items[`interest_${r.product_id}`];
+        if (item) item.paid = parseFloat(r.paid);
+      });
+    }
+    if (productsWithoutLine.size > 0) {
+      warnings.push(
+        `Interest can't be scheduled for these loans because no interest payment line is chosen: ${[...productsWithoutLine].join(", ")}. Edit the loan product on the Products page.`,
+      );
+    }
+    columns.push(...interestColumns.values());
+
+    // ---- One row per member ----
     const rows = Object.values(rowsByMember)
       .map((row) => {
         const items = Object.values(row.items);
@@ -179,7 +336,7 @@ export const getPaymentSchedule = async (req, res) => {
       })
       .filter(Boolean);
 
-    res.json({ periodStart, periodEnd, periodType, columns, rows });
+    res.json({ periodStart, periodEnd, periodType, columns, rows, warnings });
   } catch (err) {
     console.error("getPaymentSchedule failed:", err);
     res.status(500).json({ error: "Server error" });
