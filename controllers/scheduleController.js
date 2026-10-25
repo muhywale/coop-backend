@@ -213,7 +213,8 @@ export const getPaymentSchedule = async (req, res) => {
     };
 
     // (a) Reducing balance: a yearly rate on the principal still owed, every period
-    const periodsPerYear = periodType === "week" ? 52 : 12;
+    // (a) Reducing balance: the rate is a MONTHLY rate on the principal still owed.
+    //     It is a monthly charge, so it shows in the Monthly view only.
     const reducing = await pool.query(
       `SELECT l.member_id, l.principal,
               COALESCE(l.interest_rate, p.interest_rate) AS rate,
@@ -228,12 +229,18 @@ export const getPaymentSchedule = async (req, res) => {
          AND l.date_issued < $2::date`,
       [coopId, periodStart],
     );
-    for (const loan of reducing.rows) {
-      const outstanding =
-        parseFloat(loan.principal) - parseFloat(loan.repaid_before);
-      const rate = parseFloat(loan.rate || 0);
-      if (outstanding <= 0.005 || rate <= 0) continue;
-      addInterestDue(loan, (outstanding * rate) / 100 / periodsPerYear);
+    if (periodType === "month") {
+      for (const loan of reducing.rows) {
+        const outstanding =
+          parseFloat(loan.principal) - parseFloat(loan.repaid_before);
+        const rate = parseFloat(loan.rate || 0);
+        if (outstanding <= 0.005 || rate <= 0) continue;
+        addInterestDue(loan, (outstanding * rate) / 100);
+      }
+    } else if (reducing.rows.length > 0) {
+      warnings.push(
+        "Reducing-balance interest is charged monthly, so it appears in the Monthly view.",
+      );
     }
 
     // (b) Scheduled charges: one-off charges that fall in a particular month after the first payment
