@@ -1,5 +1,9 @@
 import bcrypt from "bcrypt";
 import pool from "../config/db.js";
+import {
+  validateNewPassword,
+  generateTempPassword,
+} from "./passwordController.js";
 
 const ROLES = ["member", "admin"];
 const USERNAME_RE = /^[A-Za-z0-9._-]{3,30}$/;
@@ -56,7 +60,7 @@ export const createUser = async (req, res) => {
     const coopId = req.user.cooperativeId;
     const memberId = Number(req.body.member_id);
     const username = String(req.body.username || "").trim();
-    const tempPassword = String(req.body.temp_password || "");
+    const supplied = String(req.body.temp_password || "").trim();
     const role = req.body.role || "member";
 
     if (!memberId) return res.status(400).json({ error: "Select a member" });
@@ -66,13 +70,15 @@ export const createUser = async (req, res) => {
           "Username must be 3–30 characters: letters, numbers, dot, dash or underscore",
       });
     }
-    if (tempPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: "Temporary password must be at least 6 characters" });
-    }
     if (!ROLES.includes(role))
       return res.status(400).json({ error: "Role must be member or admin" });
+
+    // Blank means "generate one for me"
+    if (supplied) {
+      const problem = validateNewPassword(supplied, username);
+      if (problem) return res.status(400).json({ error: problem });
+    }
+    const tempPassword = supplied || generateTempPassword();
 
     const member = await pool.query(
       "SELECT id FROM members WHERE id = $1 AND cooperative_id = $2",
@@ -104,7 +110,7 @@ export const createUser = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, true) RETURNING id, username, role`,
       [memberId, username, hash, role, coopId],
     );
-    res.status(201).json(result.rows[0]);
+    res.status(201).json({ ...result.rows[0], temp_password: tempPassword });
   } catch (err) {
     console.error("createUser failed:", err);
     if (err.code === "23505")
@@ -152,27 +158,41 @@ export const updateUserRole = async (req, res) => {
 
 export const resetUserPassword = async (req, res) => {
   try {
-    const tempPassword = String(req.body.temp_password || "");
-    if (tempPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: "Temporary password must be at least 6 characters" });
-    }
+    const supplied = String(req.body.temp_password || "").trim();
     if (isSelf(req))
       return res
         .status(400)
-        .json({ error: "Use Change Password for your own account" });
+        .json({ error: "Use Change password for your own account" });
 
     const target = await loadTarget(req, res);
     if (!target) return;
 
+    if (supplied) {
+      const problem = validateNewPassword(supplied, target.username);
+      if (problem) return res.status(400).json({ error: problem });
+    }
+    const tempPassword = supplied || generateTempPassword();
+
     const hash = await bcrypt.hash(tempPassword, 10);
+    // password_changed_at also signs them out of every device
     await pool.query(
-      "UPDATE users SET password_hash = $1, must_change_password = true WHERE id = $2 AND cooperative_id = $3",
-      [hash, target.id, req.user.cooperativeId],
+      `UPDATE users SET password_hash = $1, must_change_password = true, password_changed_at = $2
+       WHERE id = $3 AND cooperative_id = $4`,
+      [hash, new Date(), target.id, req.user.cooperativeId],
+    );
+
+    await pool.query(
+      `UPDATE password_reset_requests SET status = 'done', resolved_at = $1, resolved_by = $2
+       WHERE user_id = $3 AND status = 'pending'`,
+      [new Date(), req.user.userId, target.id],
+    );
+
+    console.log(
+      `[password] user ${req.user.userId} reset the password for user ${target.id}`,
     );
     res.json({
-      message: `Password reset for ${target.username}. They must change it at next login.`,
+      message: `Password reset for ${target.username}. They are signed out everywhere and must change it at next login.`,
+      temp_password: tempPassword,
     });
   } catch (err) {
     console.error("resetUserPassword failed:", err);

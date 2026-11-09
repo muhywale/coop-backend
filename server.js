@@ -22,10 +22,12 @@ import bulkPaymentRoutes from "./routes/bulkPayments.js";
 import usersRoutes from "./routes/users.js";
 import backupRoutes from "./routes/backup.js";
 import statementRoutes from "./routes/statements.js";
+import passwordRoutes from "./routes/password.js";
 
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1);
 
 const allowedOrigins = [
   "http://localhost:3000",
@@ -78,6 +80,18 @@ app.use("/api/bulk-payments", bulkPaymentRoutes);
 app.use("/api/users", usersRoutes);
 app.use("/api/backup", backupRoutes);
 app.use("/api/statements", statementRoutes);
+app.use("/api/password", passwordRoutes);
+
+app.use((req, res) => {
+  res
+    .status(404)
+    .json({ error: `Not found: ${req.method} ${req.originalUrl}` });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Server error" });
+});
 //console.log("JWT_SECRET is", process.env.JWT_SECRET);
 
 // eslint-disable-next-line no-undef

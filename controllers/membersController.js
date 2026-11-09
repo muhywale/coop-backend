@@ -38,7 +38,13 @@ export const createMember = async (req, res) => {
     const { full_name, email, phone, member_number } = req.body;
     const result = await pool.query(
       "INSERT INTO members (full_name, email, phone, member_number, cooperative_id) VALUES ($1, $2, $3, $4, $5) RETURNING *",
-      [full_name, email, phone, member_number || null, req.user.cooperativeId],
+      [
+        full_name,
+        email || null,
+        phone,
+        member_number || null,
+        req.user.cooperativeId,
+      ],
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {

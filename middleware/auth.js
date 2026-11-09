@@ -11,19 +11,32 @@ export const verifyToken = (req, res, next) => {
       return res.status(401).json({ error: "Please log in again" });
 
     try {
-      // Re-check the account every time so removed or demoted users lose access immediately
+      // Re-check the account on every request so removed or demoted users lose access immediately
       const result = await pool.query(
-        "SELECT role, cooperative_id, member_id FROM users WHERE id = $1",
+        "SELECT role, cooperative_id, member_id, password_changed_at FROM users WHERE id = $1",
         [decoded.userId],
       );
       if (result.rows.length === 0) {
         return res.status(401).json({ error: "This account no longer exists" });
       }
+      const user = result.rows[0];
+
+      // A password change or reset ends every session that started before it
+      if (
+        user.password_changed_at &&
+        decoded.iat <
+          Math.floor(new Date(user.password_changed_at).getTime() / 1000)
+      ) {
+        return res
+          .status(401)
+          .json({ error: "Your password was changed. Please log in again." });
+      }
+
       req.user = {
         ...decoded,
-        role: result.rows[0].role,
-        cooperativeId: result.rows[0].cooperative_id,
-        memberId: result.rows[0].member_id,
+        role: user.role,
+        cooperativeId: user.cooperative_id,
+        memberId: user.member_id,
       };
       next();
     } catch (e) {
