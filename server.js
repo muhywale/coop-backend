@@ -23,6 +23,7 @@ import usersRoutes from "./routes/users.js";
 import backupRoutes from "./routes/backup.js";
 import statementRoutes from "./routes/statements.js";
 import passwordRoutes from "./routes/password.js";
+import memberPortalRoutes from "./routes/memberPortal.js";
 
 dotenv.config();
 
@@ -81,6 +82,7 @@ app.use("/api/users", usersRoutes);
 app.use("/api/backup", backupRoutes);
 app.use("/api/statements", statementRoutes);
 app.use("/api/password", passwordRoutes);
+app.use("/api/member-portal", memberPortalRoutes);
 
 app.use((req, res) => {
   res
