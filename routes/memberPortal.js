@@ -6,6 +6,11 @@ import {
   getLoans,
   getStatement,
 } from "../controllers/memberPortalController.js";
+import { getMemberNotices } from "../controllers/noticesController.js";
+import {
+  listMyPayments,
+  getReceipt,
+} from "../controllers/receiptController.js";
 
 // Every route here answers only for the logged-in member, using the id from their login, never from the URL
 const requireMemberAccount = (req, res, next) => {
@@ -23,5 +28,8 @@ router.get("/summary", getSummary);
 router.get("/owing", getMySchedule);
 router.get("/loans", getLoans);
 router.get("/statement", getStatement);
+router.get("/notices", getMemberNotices);
+router.get("/payments", listMyPayments);
+router.get("/receipt/:kind/:id", getReceipt);
 
 export default router;

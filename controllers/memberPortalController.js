@@ -34,7 +34,10 @@ export const getSummary = async (req, res) => {
         "SELECT id, full_name, member_number, email, phone, status FROM members WHERE id = $1 AND cooperative_id = $2",
         [memberId, coopId],
       ),
-      pool.query("SELECT name FROM cooperatives WHERE id = $1", [coopId]),
+      pool.query(
+        "SELECT name, contact_phone, contact_whatsapp, payment_note FROM cooperatives WHERE id = $1",
+        [coopId],
+      ),
       pool.query(
         `SELECT p.id, p.name,
                 COALESCE(SUM(CASE WHEN c.type = 'withdrawal' THEN -c.amount ELSE c.amount END), 0) AS balance
@@ -69,6 +72,11 @@ export const getSummary = async (req, res) => {
     res.json({
       member: member.rows[0],
       cooperative: coop.rows[0]?.name || "",
+      contact: {
+        phone: coop.rows[0]?.contact_phone || "",
+        whatsapp: coop.rows[0]?.contact_whatsapp || "",
+        payment_note: coop.rows[0]?.payment_note || "",
+      },
       savings: savingsList,
       savings_total: round2(savingsList.reduce((s, r) => s + r.balance, 0)),
       loans: {
