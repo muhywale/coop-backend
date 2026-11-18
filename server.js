@@ -25,6 +25,8 @@ import statementRoutes from "./routes/statements.js";
 import passwordRoutes from "./routes/password.js";
 import memberPortalRoutes from "./routes/memberPortal.js";
 import noticesRoutes from "./routes/notices.js";
+import requestsRoutes from "./routes/requests.js";
+import myRequestsRoutes from "./routes/myRequests.js";
 
 dotenv.config();
 
@@ -85,6 +87,8 @@ app.use("/api/statements", statementRoutes);
 app.use("/api/password", passwordRoutes);
 app.use("/api/member-portal", memberPortalRoutes);
 app.use("/api/notices", noticesRoutes);
+app.use("/api/requests", requestsRoutes);
+app.use("/api/my-requests", myRequestsRoutes);
 
 app.use((req, res) => {
   res
