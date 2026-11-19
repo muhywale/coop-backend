@@ -27,6 +27,7 @@ import memberPortalRoutes from "./routes/memberPortal.js";
 import noticesRoutes from "./routes/notices.js";
 import requestsRoutes from "./routes/requests.js";
 import myRequestsRoutes from "./routes/myRequests.js";
+import memberDuesRoutes from "./routes/memberDues.js";
 
 dotenv.config();
 
@@ -89,6 +90,7 @@ app.use("/api/member-portal", memberPortalRoutes);
 app.use("/api/notices", noticesRoutes);
 app.use("/api/requests", requestsRoutes);
 app.use("/api/my-requests", myRequestsRoutes);
+app.use("/api/member-dues", memberDuesRoutes);
 
 app.use((req, res) => {
   res

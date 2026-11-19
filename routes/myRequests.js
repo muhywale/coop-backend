@@ -2,6 +2,7 @@ import express from "express";
 import rateLimit from "express-rate-limit";
 import { verifyToken } from "../middleware/auth.js";
 import {
+  getRequestOptions,
   createRequest,
   listMyRequests,
   cancelMyRequest,
@@ -28,6 +29,7 @@ const sendLimiter = rateLimit({
 const router = express.Router();
 router.use(verifyToken, requireMemberAccount);
 
+router.get("/options", getRequestOptions);
 router.get("/", listMyRequests);
 router.post("/", sendLimiter, createRequest);
 router.post("/:id/cancel", cancelMyRequest);

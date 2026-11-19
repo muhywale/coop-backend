@@ -1,13 +1,196 @@
 import pool from "../config/db.js";
+import { postJournal, getDefaultCashAccount } from "../utils/journal.js";
 
 const MAX_PENDING = 5;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
 const text = (v, max) =>
   String(v ?? "")
     .trim()
     .slice(0, max);
+const round2 = (n) => Math.round(n * 100) / 100;
+const money = (n) =>
+  `₦${Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+const amountOf = (v) => {
+  const n = Math.round(parseFloat(v) * 100) / 100;
+  return Number.isFinite(n) && n > 0 && n <= 10000000000 ? n : null;
+};
+const localDate = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const today = () => localDate(new Date());
+const nextMonthStart = () => {
+  const d = new Date();
+  return localDate(new Date(d.getFullYear(), d.getMonth() + 1, 1));
+};
+const monthLabel = (dateStr) => {
+  const [y, m] = dateStr.split("-").map(Number);
+  return `${MONTHS[m - 1]} ${y}`;
+};
+
+const getRules = async (db, coopId) => {
+  const result = await db.query(
+    "SELECT * FROM cooperative_rules WHERE cooperative_id = $1",
+    [coopId],
+  );
+  const row = result.rows[0];
+  return {
+    borrow_multiple:
+      row?.borrow_multiple != null ? parseFloat(row.borrow_multiple) : null,
+    borrow_deduct_outstanding: row ? row.borrow_deduct_outstanding : true,
+    borrow_product_ids: row?.borrow_product_ids || [],
+    withdrawable_product_ids: row?.withdrawable_product_ids || [],
+  };
+};
+
+// A member's balance in every active savings account
+const savingsBalances = async (db, coopId, memberId) => {
+  const result = await db.query(
+    `SELECT p.id, p.name,
+            COALESCE(SUM(CASE WHEN c.type = 'withdrawal' THEN -c.amount ELSE c.amount END), 0) AS balance
+     FROM products p
+     LEFT JOIN contributions c
+       ON c.product_id = p.id AND c.member_id = $2 AND c.cooperative_id = $1
+      AND c.type IN ('savings', 'opening_balance', 'withdrawal')
+     WHERE p.cooperative_id = $1 AND p.category = 'savings' AND p.active = true
+     GROUP BY p.id, p.name
+     ORDER BY p.name`,
+    [coopId, memberId],
+  );
+  return result.rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    balance: round2(parseFloat(r.balance)),
+  }));
+};
+
+// What the member still owes on active loans
+const outstandingLoans = async (db, coopId, memberId) => {
+  const result = await db.query(
+    `SELECT COALESCE(SUM((l.principal + l.interest_amount) - COALESCE(r.repaid, 0)), 0) AS outstanding,
+            COUNT(*)::int AS n
+     FROM loans l
+     LEFT JOIN (
+       SELECT loan_id, SUM(amount) AS repaid FROM loan_repayments WHERE cooperative_id = $2 GROUP BY loan_id
+     ) r ON r.loan_id = l.id
+     WHERE l.member_id = $1 AND l.cooperative_id = $2 AND l.status = 'active'`,
+    [memberId, coopId],
+  );
+  return {
+    outstanding: round2(parseFloat(result.rows[0].outstanding)),
+    count: result.rows[0].n,
+  };
+};
+
+// The usual borrowing limit. It is a guide only: nothing is blocked because of it.
+const borrowingGuide = (rules, balances, outstanding) => {
+  if (!rules.borrow_multiple) return null;
+  const counted = balances.filter(
+    (b) =>
+      rules.borrow_product_ids.length === 0 ||
+      rules.borrow_product_ids.includes(b.id),
+  );
+  const qualifying = round2(
+    counted.reduce((sum, b) => sum + Math.max(b.balance, 0), 0),
+  );
+  const gross = round2(qualifying * rules.borrow_multiple);
+  const deducted = rules.borrow_deduct_outstanding ? outstanding : 0;
+  return {
+    multiple: rules.borrow_multiple,
+    qualifying_savings: qualifying,
+    outstanding: round2(outstanding),
+    deduct_outstanding: rules.borrow_deduct_outstanding,
+    limit: round2(Math.max(gross - deducted, 0)),
+  };
+};
+
+const interestLabel = (p) => {
+  if (p.interest_type === "scheduled") return "scheduled interest";
+  if (p.interest_type === "reducing_balance")
+    return `${parseFloat(p.interest_rate || 0)}% per month, reducing`;
+  if (p.interest_type === "one_off")
+    return `${parseFloat(p.interest_rate || 0)}% one-off`;
+  return "";
+};
+
+// What a member is expected to pay into a compulsory account today: their own amount, else the standard one
+const currentDueAmount = async (db, coopId, memberId, productId) => {
+  const own = await db.query(
+    `SELECT amount FROM member_dues
+     WHERE member_id = $1 AND product_id = $2 AND cooperative_id = $3 AND effective_from <= CURRENT_DATE
+     ORDER BY effective_from DESC LIMIT 1`,
+    [memberId, productId, coopId],
+  );
+  if (own.rows.length > 0) return parseFloat(own.rows[0].amount);
+  const product = await db.query(
+    "SELECT expected_amount FROM products WHERE id = $1 AND cooperative_id = $2",
+    [productId, coopId],
+  );
+  return parseFloat(product.rows[0]?.expected_amount || 0);
+};
+
+// Records a withdrawal exactly like the Withdrawal page: the contribution row plus its ledger entry
+const postWithdrawal = async (
+  client,
+  { coopId, memberId, memberName, productId, amount, date },
+) => {
+  const productResult = await client.query(
+    "SELECT id, name, linked_account_id FROM products WHERE id = $1 AND cooperative_id = $2 AND category = 'savings' AND active = true",
+    [productId, coopId],
+  );
+  if (productResult.rows.length === 0)
+    throw new Error("That savings account is no longer available");
+  const product = productResult.rows[0];
+  if (!product.linked_account_id) {
+    throw new Error(
+      `${product.name} isn't linked to a ledger account yet. Link it on the Products page first.`,
+    );
+  }
+
+  const balance = await client.query(
+    `SELECT COALESCE(SUM(CASE WHEN type = 'withdrawal' THEN -amount ELSE amount END), 0) AS balance
+     FROM contributions
+     WHERE member_id = $1 AND product_id = $2 AND cooperative_id = $3
+       AND type IN ('savings', 'opening_balance', 'withdrawal')`,
+    [memberId, productId, coopId],
+  );
+  const available = parseFloat(balance.rows[0].balance);
+  if (amount > available + 0.005)
+    throw new Error(`Insufficient balance. Available: ${money(available)}`);
+
+  const cashAccountId = await getDefaultCashAccount(client, coopId);
+  const inserted = await client.query(
+    `INSERT INTO contributions (member_id, amount, type, contribution_date, notes, product_id, cooperative_id)
+     VALUES ($1, $2, 'withdrawal', $3, 'Approved member request', $4, $5) RETURNING id`,
+    [memberId, amount, date, productId, coopId],
+  );
+  await postJournal(client, {
+    entry_date: date,
+    description: `${product.name} withdrawal — ${memberName}`,
+    source: "withdrawal",
+    source_id: inserted.rows[0].id,
+    cooperativeId: coopId,
+    lines: [
+      { account_id: product.linked_account_id, debit: amount, credit: 0 },
+      { account_id: cashAccountId, debit: 0, credit: amount },
+    ],
+  });
+};
 
 // One entry per request type: how to check what the member sent, and what approval does.
-// Later pieces add withdrawal, contribution and loan here.
 const TYPES = {
   contact: {
     label: "Update phone or email",
@@ -34,6 +217,157 @@ const TYPES = {
       };
     },
   },
+
+  withdrawal: {
+    label: "Withdraw savings",
+    async validate(body, { coopId, memberId }) {
+      const rules = await getRules(pool, coopId);
+      const productId = Number(body.product_id);
+      const amount = amountOf(body.amount);
+      if (!amount) return { error: "Enter the amount you want to withdraw" };
+      if (!rules.withdrawable_product_ids.includes(productId)) {
+        return { error: "Withdrawals from that account can't be requested" };
+      }
+      const balances = await savingsBalances(pool, coopId, memberId);
+      const account = balances.find((b) => b.id === productId);
+      if (!account) return { error: "That account wasn't found" };
+      if (amount > account.balance + 0.005) {
+        return {
+          error: `You asked for ${money(amount)} but your ${account.name} balance is ${money(account.balance)}`,
+        };
+      }
+      return {
+        details: { product_id: productId, product_name: account.name, amount },
+      };
+    },
+    async approve(client, { coopId, request, body }) {
+      const d = request.details;
+      const date = DATE_RE.test(body.date || "") ? body.date : today();
+      await postWithdrawal(client, {
+        coopId,
+        memberId: request.member_id,
+        memberName: request.full_name,
+        productId: d.product_id,
+        amount: d.amount,
+        date,
+      });
+      return {
+        status: "done",
+        message: `Withdrawal of ${money(d.amount)} from ${d.product_name} recorded for ${request.full_name}.`,
+        details: { ...d, paid_on: date },
+      };
+    },
+  },
+
+  contribution: {
+    label: "Change monthly contribution",
+    async validate(body, { coopId }) {
+      const productId = Number(body.product_id);
+      const amount = amountOf(body.amount);
+      if (!amount) return { error: "Enter the new amount you want to pay" };
+      const product = await pool.query(
+        `SELECT id, name, COALESCE(due_frequency, 'monthly') AS frequency
+         FROM products
+         WHERE id = $1 AND cooperative_id = $2 AND category = 'savings' AND is_compulsory = true AND active = true`,
+        [productId, coopId],
+      );
+      if (product.rows.length === 0)
+        return { error: "You can't change the amount for that account" };
+      const p = product.rows[0];
+      return {
+        details: {
+          product_id: p.id,
+          product_name: p.name,
+          frequency: p.frequency,
+          amount,
+        },
+      };
+    },
+    async approve(client, { coopId, request, body }) {
+      const d = request.details;
+      const effective = DATE_RE.test(body.effective_from || "")
+        ? `${body.effective_from.slice(0, 7)}-01`
+        : nextMonthStart();
+      await client.query(
+        `INSERT INTO member_dues (cooperative_id, member_id, product_id, amount, effective_from)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (member_id, product_id, effective_from) DO UPDATE SET amount = EXCLUDED.amount`,
+        [coopId, request.member_id, d.product_id, d.amount, effective],
+      );
+      return {
+        status: "done",
+        message: `${request.full_name} will pay ${money(d.amount)} into ${d.product_name} from ${monthLabel(effective)}.`,
+        details: { ...d, effective_from: effective },
+      };
+    },
+  },
+
+  loan: {
+    label: "Loan application",
+    async validate(body, { coopId, memberId }) {
+      const productId = Number(body.product_id);
+      const amount = amountOf(body.amount);
+      if (!amount) return { error: "Enter the amount you want to borrow" };
+
+      const product = await pool.query(
+        "SELECT id, name FROM products WHERE id = $1 AND cooperative_id = $2 AND category = 'loan' AND active = true",
+        [productId, coopId],
+      );
+      if (product.rows.length === 0) return { error: "Choose a loan type" };
+
+      const duration = parseInt(body.duration_value, 10);
+      const durationValue =
+        Number.isInteger(duration) && duration > 0 && duration <= 120
+          ? duration
+          : null;
+      const durationUnit = body.duration_unit === "weeks" ? "weeks" : "months";
+
+      // Kept with the request so the admin can see what the guide said when it was sent
+      const [rules, balances, loans] = await Promise.all([
+        getRules(pool, coopId),
+        savingsBalances(pool, coopId, memberId),
+        outstandingLoans(pool, coopId, memberId),
+      ]);
+      const guide = borrowingGuide(rules, balances, loans.outstanding);
+
+      return {
+        details: {
+          product_id: product.rows[0].id,
+          product_name: product.rows[0].name,
+          amount,
+          duration_value: durationValue,
+          duration_unit: durationUnit,
+          purpose: text(body.purpose, 300) || null,
+          guide_limit: guide ? guide.limit : null,
+        },
+      };
+    },
+    // Approval is a decision only. The loan itself is issued on the Loans page.
+    async approve(client, { request, body }) {
+      const d = request.details;
+      const approved = amountOf(body.approved_amount) || d.amount;
+      const duration = parseInt(body.approved_duration_value, 10);
+      const unit =
+        body.approved_duration_unit === "weeks"
+          ? "weeks"
+          : body.approved_duration_unit === "months"
+            ? "months"
+            : d.duration_unit || "months";
+      return {
+        status: "approved",
+        message: `Loan approved for ${money(approved)}. Issue it on the Loans page, then mark this request as issued.`,
+        details: {
+          ...d,
+          approved_amount: approved,
+          approved_duration_value:
+            Number.isInteger(duration) && duration > 0 && duration <= 120
+              ? duration
+              : d.duration_value || null,
+          approved_duration_unit: unit,
+        },
+      };
+    },
+  },
 };
 
 const typeOf = (key) =>
@@ -45,6 +379,63 @@ const withLabel = (row) => ({
 
 // ---------- Member ----------
 
+// What the member can ask for right now (used to build their forms)
+export const getRequestOptions = async (req, res) => {
+  try {
+    const { memberId, cooperativeId: coopId } = req.user;
+    const [balances, rules, loans, pending, dues, loanProducts] =
+      await Promise.all([
+        savingsBalances(pool, coopId, memberId),
+        getRules(pool, coopId),
+        outstandingLoans(pool, coopId, memberId),
+        pool.query(
+          "SELECT COUNT(*)::int AS n FROM member_requests WHERE member_id = $1 AND status = 'pending'",
+          [memberId],
+        ),
+        pool.query(
+          `SELECT p.id, p.name, COALESCE(p.due_frequency, 'monthly') AS frequency,
+                COALESCE(
+                  (SELECT d.amount FROM member_dues d
+                   WHERE d.member_id = $2 AND d.product_id = p.id AND d.cooperative_id = $1
+                     AND d.effective_from <= CURRENT_DATE
+                   ORDER BY d.effective_from DESC LIMIT 1),
+                  p.expected_amount, 0) AS current_amount
+         FROM products p
+         WHERE p.cooperative_id = $1 AND p.category = 'savings' AND p.is_compulsory = true AND p.active = true
+         ORDER BY p.name`,
+          [coopId, memberId],
+        ),
+        pool.query(
+          `SELECT id, name, interest_type, interest_rate FROM products
+         WHERE cooperative_id = $1 AND category = 'loan' AND active = true ORDER BY name`,
+          [coopId],
+        ),
+      ]);
+    res.json({
+      withdrawable: balances.filter(
+        (b) => rules.withdrawable_product_ids.includes(b.id) && b.balance > 0,
+      ),
+      contribution_products: dues.rows.map((p) => ({
+        id: p.id,
+        name: p.name,
+        frequency: p.frequency,
+        current_amount: parseFloat(p.current_amount),
+      })),
+      loan_products: loanProducts.rows.map((p) => ({
+        id: p.id,
+        name: p.name,
+        interest_label: interestLabel(p),
+      })),
+      guide: borrowingGuide(rules, balances, loans.outstanding),
+      pending_count: pending.rows[0].n,
+      max_pending: MAX_PENDING,
+    });
+  } catch (err) {
+    console.error("getRequestOptions failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
 export const createRequest = async (req, res) => {
   try {
     const { memberId, cooperativeId: coopId } = req.user;
@@ -52,7 +443,7 @@ export const createRequest = async (req, res) => {
     if (!type)
       return res
         .status(400)
-        .json({ error: "That kind of request isn't available yet" });
+        .json({ error: "That kind of request isn't available" });
 
     const pending = await pool.query(
       "SELECT COUNT(*)::int AS n FROM member_requests WHERE member_id = $1 AND status = 'pending'",
@@ -126,6 +517,7 @@ export const cancelMyRequest = async (req, res) => {
 
 export const listRequests = async (req, res) => {
   try {
+    const coopId = req.user.cooperativeId;
     const allowed = ["pending", "approved", "done", "declined", "cancelled"];
     const status =
       req.query.status === "all"
@@ -142,9 +534,48 @@ export const listRequests = async (req, res) => {
        WHERE r.cooperative_id = $1 AND ($2::text IS NULL OR r.status = $2)
        ORDER BY (r.status = 'pending') DESC, r.created_at DESC
        LIMIT 200`,
-      [req.user.cooperativeId, status],
+      [coopId, status],
     );
-    res.json(result.rows.map(withLabel));
+
+    const rows = result.rows.map(withLabel);
+    const rules = await getRules(pool, coopId);
+
+    // The admin sees things as they are now, not as they were when the member asked
+    for (const r of rows) {
+      if (r.status === "pending" && r.type === "withdrawal") {
+        const balances = await savingsBalances(pool, coopId, r.member_id);
+        r.context = {
+          balance:
+            balances.find((b) => b.id === r.details.product_id)?.balance ?? 0,
+        };
+      } else if (r.status === "pending" && r.type === "contribution") {
+        r.context = {
+          current_amount: await currentDueAmount(
+            pool,
+            coopId,
+            r.member_id,
+            r.details.product_id,
+          ),
+        };
+      } else if (
+        r.type === "loan" &&
+        ["pending", "approved"].includes(r.status)
+      ) {
+        const [balances, loans] = await Promise.all([
+          savingsBalances(pool, coopId, r.member_id),
+          outstandingLoans(pool, coopId, r.member_id),
+        ]);
+        r.context = {
+          guide: borrowingGuide(rules, balances, loans.outstanding),
+          savings_total: round2(
+            balances.reduce((sum, b) => sum + Math.max(b.balance, 0), 0),
+          ),
+          outstanding: loans.outstanding,
+          active_loans: loans.count,
+        };
+      }
+    }
+    res.json(rows);
   } catch (err) {
     console.error("listRequests failed:", err);
     res.status(500).json({ error: "Server error" });
@@ -193,7 +624,7 @@ export const approveRequest = async (req, res) => {
       await client.query("ROLLBACK");
       return res
         .status(400)
-        .json({ error: "This kind of request can't be approved yet" });
+        .json({ error: "This kind of request can't be approved" });
     }
 
     const outcome = await type.approve(client, {
@@ -251,6 +682,31 @@ export const declineRequest = async (req, res) => {
     res.json({ message: "Request declined" });
   } catch (err) {
     console.error("declineRequest failed:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+// A loan application that was approved and has now been issued on the Loans page
+export const completeRequest = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE member_requests
+       SET status = 'done', details = details || $1::jsonb
+       WHERE id = $2 AND cooperative_id = $3 AND type = 'loan' AND status = 'approved'
+       RETURNING id`,
+      [
+        JSON.stringify({ issued_on: today() }),
+        req.params.id,
+        req.user.cooperativeId,
+      ],
+    );
+    if (result.rows.length === 0)
+      return res
+        .status(404)
+        .json({ error: "That request isn't waiting to be issued" });
+    res.json({ message: "Marked as issued" });
+  } catch (err) {
+    console.error("completeRequest failed:", err);
     res.status(500).json({ error: "Server error" });
   }
 };

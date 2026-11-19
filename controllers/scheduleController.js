@@ -107,24 +107,45 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
   });
 
   // ---- Compulsory dues ----
+  // ---- Compulsory dues (a member can have their own amount from a given month) ----
   if (duesProducts.rows.length > 0) {
-    const paid = await pool.query(
-      `SELECT member_id, product_id, COALESCE(SUM(amount), 0) AS paid
-       FROM contributions
-       WHERE cooperative_id = $1 AND product_id = ANY($2::int[])
-         AND contribution_date BETWEEN $3::date AND $4::date AND type IN ('savings', 'other')
-       GROUP BY member_id, product_id`,
-      [coopId, duesProducts.rows.map((p) => p.id), periodStart, periodEnd],
-    );
+    const productIds = duesProducts.rows.map((p) => p.id);
+    const [paid, custom] = await Promise.all([
+      pool.query(
+        `SELECT member_id, product_id, COALESCE(SUM(amount), 0) AS paid
+         FROM contributions
+         WHERE cooperative_id = $1 AND product_id = ANY($2::int[])
+           AND contribution_date BETWEEN $3::date AND $4::date AND type IN ('savings', 'other')
+         GROUP BY member_id, product_id`,
+        [coopId, productIds, periodStart, periodEnd],
+      ),
+      // The latest personal amount that had started by the beginning of this period
+      pool.query(
+        `SELECT DISTINCT ON (member_id, product_id) member_id, product_id, amount
+         FROM member_dues
+         WHERE cooperative_id = $1 AND product_id = ANY($2::int[]) AND effective_from <= $3::date
+         ORDER BY member_id, product_id, effective_from DESC`,
+        [coopId, productIds, periodStart],
+      ),
+    ]);
+
     const paidMap = {};
     paid.rows.forEach((r) => {
       paidMap[`${r.member_id}-${r.product_id}`] = parseFloat(r.paid);
     });
+    const customMap = {};
+    custom.rows.forEach((r) => {
+      customMap[`${r.member_id}-${r.product_id}`] = parseFloat(r.amount);
+    });
 
     for (const m of members.rows) {
       for (const p of duesProducts.rows) {
+        const own = customMap[`${m.id}-${p.id}`];
+        const expected =
+          own !== undefined ? own : parseFloat(p.expected_amount);
+        if (expected <= 0) continue; // a member can be set to pay nothing
         rowsByMember[m.id].items[`due_${p.id}`] = {
-          expected: parseFloat(p.expected_amount),
+          expected,
           paid: paidMap[`${m.id}-${p.id}`] || 0,
         };
       }
