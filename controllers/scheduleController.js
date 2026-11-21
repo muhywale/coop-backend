@@ -31,6 +31,14 @@ const monthIndex = (dateStr) => {
   return y * 12 + (m - 1);
 };
 
+// Whole days since 1970-01-01 for "YYYY-MM-DD", with no timezone drift
+const dayNumber = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+};
+// Monday-based week number
+const weekNumber = (dateStr) => Math.floor((dayNumber(dateStr) + 3) / 7);
+
 const readParams = (query) => ({
   periodType: query.period_type === "week" ? "week" : "month",
   anchorDate: /^\d{4}-\d{2}-\d{2}$/.test(query.date || "")
@@ -49,6 +57,14 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
       : getMonthRange(anchorDate);
   const periodEnded = periodEnd < toLocalDateString(new Date());
   const warnings = [];
+
+  // Installments and interest are rounded the way this cooperative does it (e.g. to the nearest ₦1 or ₦10)
+  const setting = await pool.query(
+    "SELECT COALESCE(repayment_rounding, 1) AS step FROM cooperatives WHERE id = $1",
+    [coopId],
+  );
+  const step = Math.max(1, parseInt(setting.rows[0]?.step, 10) || 1);
+  const roundToStep = (n) => Math.round(n / step) * step;
 
   const [duesProducts, members, otherFreqDues, noAmountDues] =
     await Promise.all([
@@ -154,9 +170,13 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
 
   // ---- Loan installments ----
   // "First payment is due" is a product setting: 0 = in the booking month, 1 = the month after
+  // ---- Loan installments ----
+  // "First payment is due" is a product setting: 0 = in the booking month, 1 = the month after
   const loans = await pool.query(
     `SELECT l.id, l.member_id, l.product_id, p.name AS product_name,
             l.principal, l.interest_amount, l.duration_value,
+            to_char(l.date_issued, 'YYYY-MM-DD') AS issued_str,
+            COALESCE(p.first_payment_offset, 1) AS first_offset,
             COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
                       WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
                         AND r.repayment_date < $3::date), 0) AS repaid_before,
@@ -189,10 +209,25 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
     const outstandingAtStart = totalOwed - parseFloat(loan.repaid_before);
     if (outstandingAtStart <= 0.005) continue; // already cleared before this period
 
-    const expected = Math.min(
-      totalOwed / loan.duration_value,
-      outstandingAtStart,
-    );
+    // Which installment this period is (0 = the first one)
+    const installmentNo =
+      periodType === "week"
+        ? weekNumber(periodStart) -
+          weekNumber(loan.issued_str) -
+          Number(loan.first_offset)
+        : monthIndex(periodStart) -
+          (monthIndex(loan.issued_str) + Number(loan.first_offset));
+
+    // Regular installments are rounded. The last one collects whatever is left,
+    // so the loan clears exactly (and so does any arrears once the term is over).
+    const isLast = installmentNo >= loan.duration_value - 1;
+    const expected = isLast
+      ? outstandingAtStart
+      : Math.min(
+          roundToStep(totalOwed / loan.duration_value),
+          outstandingAtStart,
+        );
+
     const key = `loan_${loan.product_id}`;
     if (!loanColumns.has(key))
       loanColumns.set(key, {
@@ -213,7 +248,8 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
   const productsWithoutLine = new Set();
 
   const addInterestDue = (loan, due) => {
-    if (due <= 0) return;
+    const amount = roundToStep(due);
+    if (amount <= 0) return;
     if (!loan.interest_product_id) {
       productsWithoutLine.add(loan.product_name);
       return;
@@ -230,7 +266,7 @@ export const buildSchedule = async (coopId, periodType, anchorDate) => {
       });
     }
     const item = row.items[key] || { expected: 0, paid: 0 };
-    item.expected += due;
+    item.expected += amount;
     row.items[key] = item;
   };
 

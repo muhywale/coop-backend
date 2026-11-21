@@ -136,6 +136,11 @@ const endLabel = (l) => {
 export const getLoans = async (req, res) => {
   try {
     const { memberId, cooperativeId: coopId } = req.user;
+    const coop = await pool.query(
+      "SELECT COALESCE(repayment_rounding, 1) AS step FROM cooperatives WHERE id = $1",
+      [coopId],
+    );
+    const step = Math.max(1, parseInt(coop.rows[0]?.step, 10) || 1);
 
     const [loanRows, repayRows] = await Promise.all([
       pool.query(
@@ -177,7 +182,9 @@ export const getLoans = async (req, res) => {
       const repaid = repayments.reduce((s, r) => s + r.amount, 0);
       const outstanding = Math.max(totalOwed - repaid, 0);
       const installment =
-        l.duration_value > 0 ? totalOwed / l.duration_value : null;
+        l.duration_value > 0
+          ? Math.round(totalOwed / l.duration_value / step) * step
+          : null;
 
       return {
         id: l.id,

@@ -1,7 +1,8 @@
 import pool from "../config/db.js";
 
 const FIELDS =
-  "id, name, logo_url, primary_color, contact_phone, contact_whatsapp, payment_note";
+  "id, name, logo_url, primary_color, contact_phone, contact_whatsapp, payment_note, repayment_rounding";
+const ROUNDING_STEPS = [1, 10, 50, 100, 500, 1000];
 
 export const getMyCooperative = async (req, res) => {
   try {
@@ -47,11 +48,17 @@ export const updateMyCooperative = async (req, res) => {
       String(req.body.payment_note || "")
         .trim()
         .slice(0, 200) || null;
+    const rounding = ROUNDING_STEPS.includes(
+      Number(req.body.repayment_rounding),
+    )
+      ? Number(req.body.repayment_rounding)
+      : 1;
 
     const result = await pool.query(
       `UPDATE cooperatives
-       SET name = $1, logo_url = $2, primary_color = $3, contact_phone = $4, contact_whatsapp = $5, payment_note = $6
-       WHERE id = $7 RETURNING ${FIELDS}`,
+       SET name = $1, logo_url = $2, primary_color = $3, contact_phone = $4, contact_whatsapp = $5,
+           payment_note = $6, repayment_rounding = $7
+       WHERE id = $8 RETURNING ${FIELDS}`,
       [
         name,
         logo || null,
@@ -59,6 +66,7 @@ export const updateMyCooperative = async (req, res) => {
         phone,
         whatsapp,
         note,
+        rounding,
         req.user.cooperativeId,
       ],
     );

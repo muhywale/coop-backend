@@ -41,19 +41,30 @@ const monthLabel = (dateStr) => {
   return `${MONTHS[m - 1]} ${y}`;
 };
 
-const getRules = async (db, coopId) => {
+// Savings accounts members may ask to withdraw from
+const getWithdrawableIds = async (db, coopId) => {
   const result = await db.query(
-    "SELECT * FROM cooperative_rules WHERE cooperative_id = $1",
+    "SELECT withdrawable_product_ids FROM cooperative_rules WHERE cooperative_id = $1",
     [coopId],
   );
-  const row = result.rows[0];
-  return {
-    borrow_multiple:
-      row?.borrow_multiple != null ? parseFloat(row.borrow_multiple) : null,
-    borrow_deduct_outstanding: row ? row.borrow_deduct_outstanding : true,
-    borrow_product_ids: row?.borrow_product_ids || [],
-    withdrawable_product_ids: row?.withdrawable_product_ids || [],
-  };
+  return result.rows[0]?.withdrawable_product_ids || [];
+};
+
+// Borrowing rules, one per loan type: { loan_product_id: { multiple, savings_product_ids, deduct_mode } }
+const getBorrowRules = async (db, coopId) => {
+  const result = await db.query(
+    "SELECT loan_product_id, multiple, savings_product_ids, deduct_mode FROM loan_borrowing_rules WHERE cooperative_id = $1",
+    [coopId],
+  );
+  const map = {};
+  result.rows.forEach((r) => {
+    map[r.loan_product_id] = {
+      multiple: parseFloat(r.multiple),
+      savings_product_ids: r.savings_product_ids || [],
+      deduct_mode: r.deduct_mode,
+    };
+  });
+  return map;
 };
 
 // A member's balance in every active savings account
@@ -77,42 +88,58 @@ const savingsBalances = async (db, coopId, memberId) => {
   }));
 };
 
-// What the member still owes on active loans
+// What the member still owes on active loans: in total, and per loan type
 const outstandingLoans = async (db, coopId, memberId) => {
   const result = await db.query(
-    `SELECT COALESCE(SUM((l.principal + l.interest_amount) - COALESCE(r.repaid, 0)), 0) AS outstanding,
+    `SELECT l.product_id,
+            COALESCE(SUM((l.principal + COALESCE(l.interest_amount, 0)) - COALESCE(r.repaid, 0)), 0) AS outstanding,
             COUNT(*)::int AS n
      FROM loans l
      LEFT JOIN (
        SELECT loan_id, SUM(amount) AS repaid FROM loan_repayments WHERE cooperative_id = $2 GROUP BY loan_id
      ) r ON r.loan_id = l.id
-     WHERE l.member_id = $1 AND l.cooperative_id = $2 AND l.status = 'active'`,
+     WHERE l.member_id = $1 AND l.cooperative_id = $2 AND l.status = 'active'
+     GROUP BY l.product_id`,
     [memberId, coopId],
   );
-  return {
-    outstanding: round2(parseFloat(result.rows[0].outstanding)),
-    count: result.rows[0].n,
-  };
+  const byProduct = {};
+  let total = 0;
+  let count = 0;
+  result.rows.forEach((r) => {
+    const value = round2(parseFloat(r.outstanding));
+    byProduct[r.product_id] = value;
+    total += value;
+    count += r.n;
+  });
+  return { total: round2(total), count, byProduct };
 };
 
-// The usual borrowing limit. It is a guide only: nothing is blocked because of it.
-const borrowingGuide = (rules, balances, outstanding) => {
-  if (!rules.borrow_multiple) return null;
+// The usual borrowing limit for one loan type. It is a guide only: nothing is blocked because of it.
+const guideFor = (rule, balances, owed, loanProductId) => {
+  if (!rule) return null;
+  const specific = rule.savings_product_ids.length > 0;
   const counted = balances.filter(
-    (b) =>
-      rules.borrow_product_ids.length === 0 ||
-      rules.borrow_product_ids.includes(b.id),
+    (b) => !specific || rule.savings_product_ids.includes(b.id),
   );
   const qualifying = round2(
     counted.reduce((sum, b) => sum + Math.max(b.balance, 0), 0),
   );
-  const gross = round2(qualifying * rules.borrow_multiple);
-  const deducted = rules.borrow_deduct_outstanding ? outstanding : 0;
+  const gross = round2(qualifying * rule.multiple);
+  const deducted =
+    rule.deduct_mode === "all"
+      ? owed.total
+      : rule.deduct_mode === "same"
+        ? owed.byProduct[loanProductId] || 0
+        : 0;
   return {
-    multiple: rules.borrow_multiple,
+    multiple: rule.multiple,
     qualifying_savings: qualifying,
-    outstanding: round2(outstanding),
-    deduct_outstanding: rules.borrow_deduct_outstanding,
+    savings_label:
+      specific && counted.length > 0
+        ? counted.map((b) => b.name).join(" + ")
+        : "savings",
+    deduct_mode: rule.deduct_mode,
+    outstanding: round2(deducted),
     limit: round2(Math.max(gross - deducted, 0)),
   };
 };
@@ -221,11 +248,11 @@ const TYPES = {
   withdrawal: {
     label: "Withdraw savings",
     async validate(body, { coopId, memberId }) {
-      const rules = await getRules(pool, coopId);
+      const withdrawable = await getWithdrawableIds(pool, coopId);
       const productId = Number(body.product_id);
       const amount = amountOf(body.amount);
       if (!amount) return { error: "Enter the amount you want to withdraw" };
-      if (!rules.withdrawable_product_ids.includes(productId)) {
+      if (!withdrawable.includes(productId)) {
         return { error: "Withdrawals from that account can't be requested" };
       }
       const balances = await savingsBalances(pool, coopId, memberId);
@@ -323,12 +350,12 @@ const TYPES = {
       const durationUnit = body.duration_unit === "weeks" ? "weeks" : "months";
 
       // Kept with the request so the admin can see what the guide said when it was sent
-      const [rules, balances, loans] = await Promise.all([
-        getRules(pool, coopId),
+      const [rules, balances, owed] = await Promise.all([
+        getBorrowRules(pool, coopId),
         savingsBalances(pool, coopId, memberId),
         outstandingLoans(pool, coopId, memberId),
       ]);
-      const guide = borrowingGuide(rules, balances, loans.outstanding);
+      const guide = guideFor(rules[productId], balances, owed, productId);
 
       return {
         details: {
@@ -383,17 +410,25 @@ const withLabel = (row) => ({
 export const getRequestOptions = async (req, res) => {
   try {
     const { memberId, cooperativeId: coopId } = req.user;
-    const [balances, rules, loans, pending, dues, loanProducts] =
-      await Promise.all([
-        savingsBalances(pool, coopId, memberId),
-        getRules(pool, coopId),
-        outstandingLoans(pool, coopId, memberId),
-        pool.query(
-          "SELECT COUNT(*)::int AS n FROM member_requests WHERE member_id = $1 AND status = 'pending'",
-          [memberId],
-        ),
-        pool.query(
-          `SELECT p.id, p.name, COALESCE(p.due_frequency, 'monthly') AS frequency,
+    const [
+      balances,
+      withdrawable,
+      owed,
+      borrowRules,
+      pending,
+      dues,
+      loanProducts,
+    ] = await Promise.all([
+      savingsBalances(pool, coopId, memberId),
+      getWithdrawableIds(pool, coopId),
+      outstandingLoans(pool, coopId, memberId),
+      getBorrowRules(pool, coopId),
+      pool.query(
+        "SELECT COUNT(*)::int AS n FROM member_requests WHERE member_id = $1 AND status = 'pending'",
+        [memberId],
+      ),
+      pool.query(
+        `SELECT p.id, p.name, COALESCE(p.due_frequency, 'monthly') AS frequency,
                 COALESCE(
                   (SELECT d.amount FROM member_dues d
                    WHERE d.member_id = $2 AND d.product_id = p.id AND d.cooperative_id = $1
@@ -403,17 +438,17 @@ export const getRequestOptions = async (req, res) => {
          FROM products p
          WHERE p.cooperative_id = $1 AND p.category = 'savings' AND p.is_compulsory = true AND p.active = true
          ORDER BY p.name`,
-          [coopId, memberId],
-        ),
-        pool.query(
-          `SELECT id, name, interest_type, interest_rate FROM products
+        [coopId, memberId],
+      ),
+      pool.query(
+        `SELECT id, name, interest_type, interest_rate FROM products
          WHERE cooperative_id = $1 AND category = 'loan' AND active = true ORDER BY name`,
-          [coopId],
-        ),
-      ]);
+        [coopId],
+      ),
+    ]);
     res.json({
       withdrawable: balances.filter(
-        (b) => rules.withdrawable_product_ids.includes(b.id) && b.balance > 0,
+        (b) => withdrawable.includes(b.id) && b.balance > 0,
       ),
       contribution_products: dues.rows.map((p) => ({
         id: p.id,
@@ -421,12 +456,13 @@ export const getRequestOptions = async (req, res) => {
         frequency: p.frequency,
         current_amount: parseFloat(p.current_amount),
       })),
+      // Each loan type carries its own guide, because the multiple and the savings that count differ by type
       loan_products: loanProducts.rows.map((p) => ({
         id: p.id,
         name: p.name,
         interest_label: interestLabel(p),
+        guide: guideFor(borrowRules[p.id], balances, owed, p.id),
       })),
-      guide: borrowingGuide(rules, balances, loans.outstanding),
       pending_count: pending.rows[0].n,
       max_pending: MAX_PENDING,
     });
@@ -538,7 +574,7 @@ export const listRequests = async (req, res) => {
     );
 
     const rows = result.rows.map(withLabel);
-    const rules = await getRules(pool, coopId);
+    const borrowRules = await getBorrowRules(pool, coopId);
 
     // The admin sees things as they are now, not as they were when the member asked
     for (const r of rows) {
@@ -561,17 +597,22 @@ export const listRequests = async (req, res) => {
         r.type === "loan" &&
         ["pending", "approved"].includes(r.status)
       ) {
-        const [balances, loans] = await Promise.all([
+        const [balances, owed] = await Promise.all([
           savingsBalances(pool, coopId, r.member_id),
           outstandingLoans(pool, coopId, r.member_id),
         ]);
         r.context = {
-          guide: borrowingGuide(rules, balances, loans.outstanding),
+          guide: guideFor(
+            borrowRules[r.details.product_id],
+            balances,
+            owed,
+            r.details.product_id,
+          ),
           savings_total: round2(
             balances.reduce((sum, b) => sum + Math.max(b.balance, 0), 0),
           ),
-          outstanding: loans.outstanding,
-          active_loans: loans.count,
+          outstanding: owed.total,
+          active_loans: owed.count,
         };
       }
     }
