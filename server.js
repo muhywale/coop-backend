@@ -28,6 +28,8 @@ import noticesRoutes from "./routes/notices.js";
 import requestsRoutes from "./routes/requests.js";
 import myRequestsRoutes from "./routes/myRequests.js";
 import memberDuesRoutes from "./routes/memberDues.js";
+import { activityLogger } from "./middleware/activityLogger.js";
+import activityRoutes from "./routes/activity.js";
 
 dotenv.config();
 
@@ -46,6 +48,10 @@ app.use(
     credentials: true,
   }),
 );
+
+app.use(activityLogger); // right after express.json() and cookieParser(), before any route
+// ...with your other routes:
+app.use("/api/activity", activityRoutes);
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
