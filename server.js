@@ -30,6 +30,7 @@ import myRequestsRoutes from "./routes/myRequests.js";
 import memberDuesRoutes from "./routes/memberDues.js";
 import { activityLogger } from "./middleware/activityLogger.js";
 import activityRoutes from "./routes/activity.js";
+import yearEndRoutes from "./routes/yearEnd.js";
 
 dotenv.config();
 
@@ -97,6 +98,7 @@ app.use("/api/notices", noticesRoutes);
 app.use("/api/requests", requestsRoutes);
 app.use("/api/my-requests", myRequestsRoutes);
 app.use("/api/member-dues", memberDuesRoutes);
+app.use("/api/year-end", yearEndRoutes);
 
 app.use((req, res) => {
   res
