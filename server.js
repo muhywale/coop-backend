@@ -34,7 +34,7 @@ import activityRoutes from "./routes/activity.js";
 dotenv.config();
 
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", 2);
 
 const allowedOrigins = [
   "http://localhost:3000",
