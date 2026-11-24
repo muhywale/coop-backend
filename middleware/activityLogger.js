@@ -100,6 +100,8 @@ const WORDING = [
   [/^POST \/api\/loans$/, "Issued a loan"],
   [/^DELETE \/api\/loans\/:id$/, "Deleted a loan"],
   [/^GET \/api\/backup/, "Downloaded a backup"],
+  [/^PUT \/api\/fine-rules$/, "Changed the fine rules"],
+  [/^PUT \/api\/loan-form-fees$/, "Changed the loan form amounts"],
 ];
 
 // "/api/loans/12" -> "/api/loans/:id"

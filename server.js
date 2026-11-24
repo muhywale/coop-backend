@@ -31,6 +31,8 @@ import memberDuesRoutes from "./routes/memberDues.js";
 import { activityLogger } from "./middleware/activityLogger.js";
 import activityRoutes from "./routes/activity.js";
 import yearEndRoutes from "./routes/yearEnd.js";
+import fineRulesRoutes from "./routes/fineRules.js";
+import loanFormFeeRoutes from "./routes/loanFormFees.js";
 
 dotenv.config();
 
@@ -99,6 +101,8 @@ app.use("/api/requests", requestsRoutes);
 app.use("/api/my-requests", myRequestsRoutes);
 app.use("/api/member-dues", memberDuesRoutes);
 app.use("/api/year-end", yearEndRoutes);
+app.use("/api/fine-rules", fineRulesRoutes);
+app.use("/api/loan-form-fees", loanFormFeeRoutes);
 
 app.use((req, res) => {
   res

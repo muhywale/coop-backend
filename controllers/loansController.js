@@ -62,11 +62,25 @@ export const createLoan = async (req, res) => {
       duration_value,
       duration_unit,
       date_issued,
+      form_fee,
     } = req.body;
     const coopId = req.user.cooperativeId;
 
     if (!principal || parseFloat(principal) <= 0) {
       return res.status(400).json({ error: "Enter a valid principal amount" });
+    }
+    const feeAmount =
+      form_fee === "" || form_fee == null
+        ? 0
+        : Math.round(parseFloat(form_fee) * 100) / 100;
+    if (
+      !Number.isFinite(feeAmount) ||
+      feeAmount < 0 ||
+      feeAmount > 10000000000
+    ) {
+      return res
+        .status(400)
+        .json({ error: "The loan form amount isn't valid" });
     }
 
     // Use the date sent by the form; fall back to today only if missing
@@ -91,14 +105,29 @@ export const createLoan = async (req, res) => {
     if (product.rows.length === 0) throw new Error("Product not found");
     const { interest_rate, interest_type, linked_account_id } = product.rows[0];
 
+    // The form amount is an expected payment, so it needs the payment line it will be paid into
+    if (feeAmount > 0) {
+      const line = await client.query(
+        `SELECT p.id FROM cooperative_rules r
+         JOIN products p ON p.id = r.form_fee_product_id AND p.cooperative_id = r.cooperative_id
+         WHERE r.cooperative_id = $1 AND p.linked_account_id IS NOT NULL`,
+        [coopId],
+      );
+      if (line.rows.length === 0) {
+        throw new Error(
+          "Set up the loan form payment line first (Settings, Loan Form Amounts)",
+        );
+      }
+    }
+
     const interestAmount =
       interest_type === "one_off"
         ? (parseFloat(principal) * parseFloat(interest_rate || 0)) / 100
         : 0;
 
     const result = await client.query(
-      `INSERT INTO loans (member_id, principal, interest_rate, interest_amount, date_issued, status, product_id, cooperative_id, duration_value, duration_unit)
-       VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9) RETURNING *`,
+      `INSERT INTO loans (member_id, principal, interest_rate, interest_amount, date_issued, status, product_id, cooperative_id, duration_value, duration_unit, form_fee_due)
+       VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10) RETURNING *`,
       [
         member_id,
         principal,
@@ -109,6 +138,7 @@ export const createLoan = async (req, res) => {
         coopId,
         duration_value || null,
         duration_unit || "months",
+        feeAmount,
       ],
     );
     const newLoanId = result.rows[0].id;

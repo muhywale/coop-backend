@@ -40,6 +40,13 @@ export const getYearEndReport = async (req, res) => {
     );
     const interestIds = interestLines.rows.map((r) => r.id);
 
+    const fineSetting = await pool.query(
+      "SELECT fine_product_id FROM cooperative_rules WHERE cooperative_id = $1",
+      [coopId],
+    );
+    const fineId = fineSetting.rows[0]?.fine_product_id || null;
+    const excludedIds = fineId ? [...interestIds, fineId] : interestIds;
+
     const [
       products,
       members,
@@ -54,7 +61,7 @@ export const getYearEndReport = async (req, res) => {
         `SELECT id, name FROM products
          WHERE cooperative_id = $1 AND category = 'savings' AND id <> ALL($2::int[])
          ORDER BY name`,
-        [coopId, interestIds],
+        [coopId, excludedIds],
       ),
       pool.query(
         "SELECT id, full_name, member_number, status FROM members WHERE cooperative_id = $1 ORDER BY full_name",
@@ -68,7 +75,7 @@ export const getYearEndReport = async (req, res) => {
          WHERE c.cooperative_id = $1 AND p.category = 'savings' AND p.id <> ALL($2::int[])
            AND c.type IN ('savings', 'opening_balance', 'withdrawal') AND c.contribution_date < $3::date
          GROUP BY c.member_id, c.product_id`,
-        [coopId, interestIds, end],
+        [coopId, excludedIds, end],
       ),
       // Deposits and withdrawals during the year
       pool.query(
@@ -79,7 +86,7 @@ export const getYearEndReport = async (req, res) => {
          WHERE c.cooperative_id = $1 AND p.category = 'savings' AND p.id <> ALL($2::int[])
            AND c.contribution_date >= $3::date AND c.contribution_date < $4::date
          GROUP BY c.member_id`,
-        [coopId, interestIds, start, end],
+        [coopId, excludedIds, start, end],
       ),
       // Interest collected through separate payment lines
       pool.query(
