@@ -18,7 +18,8 @@ const MONTHS = [
 
 const compulsoryProducts = (coopId) =>
   pool.query(
-    `SELECT id, name, expected_amount, COALESCE(due_frequency, 'monthly') AS frequency
+    `SELECT id, name, expected_amount, COALESCE(due_frequency, 'monthly') AS frequency,
+            due_start_month, due_end_month
      FROM products
      WHERE cooperative_id = $1 AND active = true AND is_compulsory = true AND category <> 'loan'
      ORDER BY name`,
@@ -55,6 +56,8 @@ export const getMemberDues = async (req, res) => {
         name: product.name,
         standard_amount: standard,
         frequency: product.frequency,
+        start_month: product.due_start_month || null,
+        end_month: product.due_end_month || null,
       },
       members: members.rows.map((m) => ({
         id: m.id,
@@ -136,5 +139,40 @@ export const saveMemberDues = async (req, res) => {
     res.status(500).json({ error: "Server error" });
   } finally {
     client.release();
+  }
+};
+
+// PUT /api/member-dues/season   body: { product_id, start_month, end_month }  (blank = no limit)
+export const saveDueSeason = async (req, res) => {
+  try {
+    const coopId = req.user.cooperativeId;
+    const productId = Number(req.body.product_id);
+    const month = (v) => {
+      if (v === "" || v == null) return null;
+      const n = Number(v);
+      return Number.isInteger(n) && n >= 1 && n <= 12 ? n : undefined;
+    };
+    const start = month(req.body.start_month);
+    const end = month(req.body.end_month);
+    if (start === undefined || end === undefined)
+      return res.status(400).json({ error: "Choose a month from the list" });
+
+    const result = await pool.query(
+      `UPDATE products SET due_start_month = $1, due_end_month = $2
+       WHERE id = $3 AND cooperative_id = $4 AND is_compulsory = true AND category <> 'loan'
+       RETURNING name`,
+      [start, end, productId, coopId],
+    );
+    if (result.rows.length === 0)
+      return res.status(404).json({ error: "That isn't a compulsory account" });
+
+    const when =
+      !start && !end
+        ? "every month of the year"
+        : `from ${MONTHS[(start || 1) - 1]} to ${MONTHS[(end || 12) - 1]}, every year`;
+    res.json({ message: `${result.rows[0].name} is now expected ${when}.` });
+  } catch (err) {
+    console.error("saveDueSeason failed:", err);
+    res.status(500).json({ error: "Server error" });
   }
 };

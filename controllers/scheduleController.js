@@ -69,7 +69,7 @@ const buildCore = async (coopId, periodType, anchorDate) => {
   const [duesProducts, members, otherFreqDues, noAmountDues] =
     await Promise.all([
       pool.query(
-        `SELECT id, name, expected_amount FROM products
+        `SELECT id, name, expected_amount, due_start_month, due_end_month FROM products
        WHERE cooperative_id = $1 AND active = true AND is_compulsory = true
          AND COALESCE(due_frequency, 'monthly') = $2 AND COALESCE(expected_amount, 0) > 0
        ORDER BY name`,
@@ -95,6 +95,20 @@ const buildCore = async (coopId, periodType, anchorDate) => {
         [coopId],
       ),
     ]);
+
+  // A compulsory payment can start (and stop) at set months of the year, e.g. "from March every year"
+  const periodMonth = Number(periodStart.slice(5, 7));
+  const inSeason = (p) => {
+    const from = p.due_start_month;
+    const to = p.due_end_month;
+    if (!from && !to) return true;
+    const start = from || 1;
+    const end = to || 12;
+    return start <= end
+      ? periodMonth >= start && periodMonth <= end
+      : periodMonth >= start || periodMonth <= end;
+  };
+  duesProducts.rows = duesProducts.rows.filter(inSeason);
 
   if (otherFreqDues.rows.length > 0) {
     warnings.push(
