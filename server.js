@@ -33,6 +33,7 @@ import activityRoutes from "./routes/activity.js";
 import yearEndRoutes from "./routes/yearEnd.js";
 import fineRulesRoutes from "./routes/fineRules.js";
 import loanFormFeeRoutes from "./routes/loanFormFees.js";
+import memberProfileRoutes from "./routes/memberProfiles.js";
 
 dotenv.config();
 
@@ -103,6 +104,7 @@ app.use("/api/member-dues", memberDuesRoutes);
 app.use("/api/year-end", yearEndRoutes);
 app.use("/api/fine-rules", fineRulesRoutes);
 app.use("/api/loan-form-fees", loanFormFeeRoutes);
+app.use("/api/member-profiles", memberProfileRoutes);
 
 app.use((req, res) => {
   res

@@ -106,6 +106,7 @@ const WORDING = [
     /^PUT \/api\/member-dues\/season$/,
     "Changed the months a compulsory payment applies",
   ],
+  [/^PUT \/api\/member-profiles\/:id$/, "Edited a member's details"],
 ];
 
 // "/api/loans/12" -> "/api/loans/:id"
@@ -243,7 +244,7 @@ const record = async (req, res) => {
     role: req.user.role,
     action: `${method} ${path}`,
     summary: describe(method, path),
-    details: safeDetails(req),
+    details: { ...safeDetails(req), ...(res.locals.activityDetails || {}) },
     ip: req.ip,
   });
 };

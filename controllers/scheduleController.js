@@ -184,8 +184,6 @@ const buildCore = async (coopId, periodType, anchorDate) => {
 
   // ---- Loan installments ----
   // "First payment is due" is a product setting: 0 = in the booking month, 1 = the month after
-  // ---- Loan installments ----
-  // "First payment is due" is a product setting: 0 = in the booking month, 1 = the month after
   const loans = await pool.query(
     `SELECT l.id, l.member_id, l.product_id, p.name AS product_name,
             l.principal, l.interest_amount, l.duration_value,
@@ -196,7 +194,11 @@ const buildCore = async (coopId, periodType, anchorDate) => {
                         AND r.repayment_date < $3::date), 0) AS repaid_before,
             COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
                       WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id
-                        AND r.repayment_date BETWEEN $3::date AND $4::date), 0) AS paid_in_period
+                        AND r.repayment_date BETWEEN $3::date AND $4::date), 0) AS paid_in_period,
+            (SELECT o.amount FROM loan_installment_overrides o
+             WHERE o.loan_id = l.id AND o.effective_from <= $3::date
+               AND (o.effective_to IS NULL OR o.effective_to >= $3::date)
+             ORDER BY o.effective_from DESC LIMIT 1) AS override_amount
      FROM loans l
      JOIN products p ON l.product_id = p.id
      WHERE l.cooperative_id = $1 AND l.duration_unit = $2 AND l.duration_value > 0
@@ -232,15 +234,16 @@ const buildCore = async (coopId, periodType, anchorDate) => {
         : monthIndex(periodStart) -
           (monthIndex(loan.issued_str) + Number(loan.first_offset));
 
-    // Regular installments are rounded. The last one collects whatever is left,
-    // so the loan clears exactly (and so does any arrears once the term is over).
+    // The regular installment is rounded; an approved higher amount replaces it for the months it covers.
+    // The last installment collects whatever is left, so the loan clears exactly.
+    const regular =
+      loan.override_amount !== null
+        ? parseFloat(loan.override_amount)
+        : roundToStep(totalOwed / loan.duration_value);
     const isLast = installmentNo >= loan.duration_value - 1;
     const expected = isLast
       ? outstandingAtStart
-      : Math.min(
-          roundToStep(totalOwed / loan.duration_value),
-          outstandingAtStart,
-        );
+      : Math.min(regular, outstandingAtStart);
 
     const key = `loan_${loan.product_id}`;
     if (!loanColumns.has(key))

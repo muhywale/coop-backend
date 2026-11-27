@@ -217,6 +217,54 @@ const postWithdrawal = async (
   });
 };
 
+// The first day of the period a date falls in: the 1st for monthly loans, that week's Monday for weekly ones
+const mondayOf = (dateStr) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return localDate(d);
+};
+const periodStartFor = (unit, dateStr) =>
+  unit === "weeks" ? mondayOf(dateStr) : `${dateStr.slice(0, 7)}-01`;
+const periodLabel = (unit, start) =>
+  unit === "weeks"
+    ? `the week of ${new Date(`${start}T00:00:00`).toLocaleDateString()}`
+    : monthLabel(start);
+
+const getRoundingStep = async (db, coopId) => {
+  const result = await db.query(
+    "SELECT COALESCE(repayment_rounding, 1) AS step FROM cooperatives WHERE id = $1",
+    [coopId],
+  );
+  return Math.max(1, parseInt(result.rows[0]?.step, 10) || 1);
+};
+
+// A member's active loans that have a repayment schedule: the regular installment and what is still owed
+const repayableLoans = async (db, coopId, memberId, step) => {
+  const result = await db.query(
+    `SELECT l.id, l.principal, l.interest_amount, l.duration_value, l.duration_unit, p.name AS product_name,
+            to_char(l.date_issued, 'YYYY-MM-DD') AS date_issued,
+            COALESCE((SELECT SUM(r.amount) FROM loan_repayments r
+                      WHERE r.loan_id = l.id AND r.cooperative_id = l.cooperative_id), 0) AS repaid
+     FROM loans l JOIN products p ON p.id = l.product_id
+     WHERE l.member_id = $1 AND l.cooperative_id = $2 AND l.status = 'active' AND l.duration_value > 0
+     ORDER BY l.date_issued`,
+    [memberId, coopId],
+  );
+  return result.rows
+    .map((l) => {
+      const owed = parseFloat(l.principal) + parseFloat(l.interest_amount || 0);
+      return {
+        id: l.id,
+        product_name: l.product_name,
+        date_issued: l.date_issued,
+        unit: l.duration_unit,
+        outstanding: round2(Math.max(owed - parseFloat(l.repaid), 0)),
+        installment: Math.round(owed / l.duration_value / step) * step,
+      };
+    })
+    .filter((l) => l.outstanding > 0.005);
+};
+
 // One entry per request type: how to check what the member sent, and what approval does.
 const TYPES = {
   contact: {
@@ -395,6 +443,83 @@ const TYPES = {
       };
     },
   },
+  repayment: {
+    label: "Pay more on a loan",
+    async validate(body, { coopId, memberId }) {
+      const loanId = Number(body.loan_id);
+      const amount = amountOf(body.amount);
+      if (!amount)
+        return { error: "Enter the amount you want to pay each time" };
+
+      const step = await getRoundingStep(pool, coopId);
+      const loans = await repayableLoans(pool, coopId, memberId, step);
+      const loan = loans.find((l) => l.id === loanId);
+      if (!loan) return { error: "Choose one of your active loans" };
+      if (amount < loan.installment - 0.005) {
+        return {
+          error: `Your regular installment is ${money(loan.installment)}. Enter that or more. Enter exactly ${money(loan.installment)} to go back to the regular amount.`,
+        };
+      }
+      if (amount > loan.outstanding + 0.005)
+        return {
+          error: `You only owe ${money(loan.outstanding)} on this loan`,
+        };
+
+      const mode = body.mode === "once" ? "once" : "from";
+      const raw = String(body.start || "");
+      if (!DATE_RE.test(raw) && !/^\d{4}-\d{2}$/.test(raw))
+        return { error: "Choose when this starts" };
+      const start = periodStartFor(
+        loan.unit,
+        raw.length === 7 ? `${raw}-01` : raw,
+      );
+      if (start < periodStartFor(loan.unit, today()))
+        return { error: "Choose this period or a later one" };
+
+      return {
+        details: {
+          loan_id: loan.id,
+          product_name: loan.product_name,
+          date_issued: loan.date_issued,
+          unit: loan.unit,
+          amount,
+          standard_amount: loan.installment,
+          mode,
+          start,
+        },
+      };
+    },
+    // Approval changes what is expected. It does not post any money.
+    async approve(client, { coopId, request, body }) {
+      const d = request.details;
+      const approved = amountOf(body.approved_amount) || d.amount;
+      const startInput = DATE_RE.test(body.effective_from || "")
+        ? body.effective_from
+        : d.start;
+      const start = periodStartFor(d.unit, startInput);
+
+      const loan = await client.query(
+        "SELECT id FROM loans WHERE id = $1 AND member_id = $2 AND cooperative_id = $3 AND status = 'active'",
+        [d.loan_id, request.member_id, coopId],
+      );
+      if (loan.rows.length === 0)
+        throw new Error("That loan is no longer active");
+
+      await client.query(
+        `INSERT INTO loan_installment_overrides (cooperative_id, loan_id, amount, effective_from, effective_to)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (loan_id, effective_from) DO UPDATE SET amount = EXCLUDED.amount, effective_to = EXCLUDED.effective_to`,
+        [coopId, d.loan_id, approved, start, d.mode === "once" ? start : null],
+      );
+      return {
+        status: "done",
+        message: `${request.full_name} is now expected to pay ${money(approved)} on ${d.product_name} ${
+          d.mode === "once" ? "for" : "from"
+        } ${periodLabel(d.unit, start)}.`,
+        details: { ...d, approved_amount: approved, start },
+      };
+    },
+  },
 };
 
 const typeOf = (key) =>
@@ -410,6 +535,7 @@ const withLabel = (row) => ({
 export const getRequestOptions = async (req, res) => {
   try {
     const { memberId, cooperativeId: coopId } = req.user;
+    const step = await getRoundingStep(pool, coopId);
     const [
       balances,
       withdrawable,
@@ -418,6 +544,7 @@ export const getRequestOptions = async (req, res) => {
       pending,
       dues,
       loanProducts,
+      repayable,
     ] = await Promise.all([
       savingsBalances(pool, coopId, memberId),
       getWithdrawableIds(pool, coopId),
@@ -445,6 +572,7 @@ export const getRequestOptions = async (req, res) => {
          WHERE cooperative_id = $1 AND category = 'loan' AND active = true ORDER BY name`,
         [coopId],
       ),
+      repayableLoans(pool, coopId, memberId, step),
     ]);
     res.json({
       withdrawable: balances.filter(
@@ -463,6 +591,7 @@ export const getRequestOptions = async (req, res) => {
         interest_label: interestLabel(p),
         guide: guideFor(borrowRules[p.id], balances, owed, p.id),
       })),
+      repayable_loans: repayable,
       pending_count: pending.rows[0].n,
       max_pending: MAX_PENDING,
     });
@@ -486,11 +615,9 @@ export const createRequest = async (req, res) => {
       [memberId],
     );
     if (pending.rows[0].n >= MAX_PENDING) {
-      return res
-        .status(400)
-        .json({
-          error: `You already have ${MAX_PENDING} requests waiting. Please wait for your admin to respond.`,
-        });
+      return res.status(400).json({
+        error: `You already have ${MAX_PENDING} requests waiting. Please wait for your admin to respond.`,
+      });
     }
 
     const checked = await type.validate(req.body, { coopId, memberId });
@@ -575,6 +702,7 @@ export const listRequests = async (req, res) => {
 
     const rows = result.rows.map(withLabel);
     const borrowRules = await getBorrowRules(pool, coopId);
+    const step = await getRoundingStep(pool, coopId);
 
     // The admin sees things as they are now, not as they were when the member asked
     for (const r of rows) {
@@ -614,6 +742,12 @@ export const listRequests = async (req, res) => {
           outstanding: owed.total,
           active_loans: owed.count,
         };
+      } else if (r.status === "pending" && r.type === "repayment") {
+        const loans = await repayableLoans(pool, coopId, r.member_id, step);
+        const loan = loans.find((l) => l.id === r.details.loan_id);
+        r.context = loan
+          ? { outstanding: loan.outstanding, installment: loan.installment }
+          : { closed: true };
       }
     }
     res.json(rows);
@@ -692,11 +826,9 @@ export const approveRequest = async (req, res) => {
     await client.query("ROLLBACK");
     console.error("approveRequest failed:", err);
     if (err.code === "23505")
-      return res
-        .status(409)
-        .json({
-          error: "That email address is already used by another member",
-        });
+      return res.status(409).json({
+        error: "That email address is already used by another member",
+      });
     res.status(400).json({ error: err.message });
   } finally {
     client.release();
